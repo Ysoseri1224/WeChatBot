@@ -1,0 +1,486 @@
+import os
+import re
+import time
+import base64
+import logging
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from pathlib import Path
+from queue import Empty
+from threading import Thread
+from dotenv import load_dotenv
+from openai import OpenAI
+from wcferry import Wcf, WxMsg
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot.log", encoding="utf-8"),
+    ],
+)
+LOG = logging.getLogger("WeChatBot")
+
+GROUP_TRIGGER_PREFIX = os.getenv("GROUP_TRIGGER_PREFIX", "").strip()
+PRIVATE_CHAT_REPLY = os.getenv("PRIVATE_CHAT_REPLY", "true").lower() == "true"
+GROUP_WHITELIST = [g.strip() for g in os.getenv("GROUP_WHITELIST", "").split(",") if g.strip()]
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "你是一个智能助手，请用中文简洁地回答用户的问题。")
+WECHAT_PATH = os.getenv("WECHAT_PATH", "").strip() or None
+
+AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek").lower().strip()
+
+_PROVIDER_CONFIGS = {
+    "gpt":      (os.getenv("GPT_API_KEY"),      os.getenv("GPT_BASE_URL",      "https://api.openai.com/v1"),   os.getenv("GPT_MODEL",      "gpt-4o-mini")),
+    "deepseek": (os.getenv("DEEPSEEK_API_KEY"), os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),    os.getenv("DEEPSEEK_MODEL", "deepseek-chat")),
+    "claude":   (os.getenv("CLAUDE_API_KEY"),   os.getenv("CLAUDE_BASE_URL",   "https://api.anthropic.com/v1"),os.getenv("CLAUDE_MODEL",   "claude-3-5-haiku-20241022")),
+    "minimax":  (os.getenv("MINIMAX_API_KEY"),  os.getenv("MINIMAX_BASE_URL",  "https://api.minimax.io/v1"),   os.getenv("MINIMAX_MODEL",  "MiniMax-M2.5-highspeed")),
+}
+
+if AI_PROVIDER not in _PROVIDER_CONFIGS:
+    raise ValueError(f"未知 AI_PROVIDER: {AI_PROVIDER}，可选: {list(_PROVIDER_CONFIGS.keys())}")
+
+_api_key, _base_url, AI_MODEL = _PROVIDER_CONFIGS[AI_PROVIDER]
+
+client = OpenAI(api_key=_api_key, base_url=_base_url)
+
+conversation_history: dict = {}
+group_whitelist_ids: set = set()
+group_context_buffer: dict = {}   # roomid -> list of "昵称: 内容" 字符串
+group_pending_media: dict = {}    # roomid -> {"type": "image"|"file", "msg": WxMsg, "filename": str}
+GROUP_CONTEXT_LIMIT = int(os.getenv("GROUP_CONTEXT_LIMIT", "50"))  # 最多保留条数
+
+VISION_PROVIDERS = {"gpt", "claude"}  # 支持图片的供应商
+WECHAT_FILE_DIR = os.getenv("WECHAT_FILE_DIR", r"D:\WeChat Files\wxid_amkb0miro4hf22\FileStorage\File")
+MEMORY_DIR = Path(os.getenv("MEMORY_DIR", r"D:\Weixin\bot\memory"))
+MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def memory_load_all() -> str:
+    files = sorted(MEMORY_DIR.glob("*.txt"))
+    if not files:
+        return ""
+    parts = []
+    for f in files:
+        parts.append(f"=== 记忆：{f.stem} ===\n{f.read_text(encoding='utf-8', errors='ignore').strip()}")
+    return "\n\n".join(parts)
+
+
+def memory_list() -> str:
+    files = sorted(MEMORY_DIR.glob("*.txt"))
+    if not files:
+        return "当前没有任何记忆。"
+    lines = []
+    for i, f in enumerate(files, 1):
+        size = f.stat().st_size
+        mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%m-%d %H:%M")
+        lines.append(f"{i}. {f.name}  ({size}B, {mtime})")
+    return "\n".join(lines)
+
+
+def memory_save(name: str, content: str) -> str:
+    safe = re.sub(r'[\\/:*?"<>|]', '_', name.strip())
+    if not safe.endswith(".txt"):
+        safe += ".txt"
+    path = MEMORY_DIR / safe
+    path.write_text(content.strip(), encoding="utf-8")
+    return safe
+
+
+def memory_delete(name: str) -> bool:
+    safe = re.sub(r'[\\/:*?"<>|]', '_', name.strip())
+    if not safe.endswith(".txt"):
+        safe += ".txt"
+    path = MEMORY_DIR / safe
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
+def memory_read(name: str) -> str:
+    safe = re.sub(r'[\\/:*?"<>|]', '_', name.strip())
+    if not safe.endswith(".txt"):
+        safe += ".txt"
+    path = MEMORY_DIR / safe
+    if path.exists():
+        return path.read_text(encoding="utf-8", errors="ignore").strip()
+    return ""
+
+
+def extract_file_text(filepath: str) -> str:
+    ext = Path(filepath).suffix.lower()
+    try:
+        if ext == ".md" or ext == ".txt":
+            return Path(filepath).read_text(encoding="utf-8", errors="ignore")
+        elif ext == ".docx":
+            import docx
+            doc = docx.Document(filepath)
+            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        elif ext == ".pdf":
+            import fitz
+            doc = fitz.open(filepath)
+            return "\n".join(page.get_text() for page in doc)
+        else:
+            return ""
+    except Exception as e:
+        LOG.error(f"文件解析失败 {filepath}: {e}")
+        return ""
+
+
+def ask_ai_with_image(session_id: str, image_path: str, user_text: str, context_lines: list = None) -> str:
+    if AI_PROVIDER not in VISION_PROVIDERS:
+        return f"[当前模型 {AI_MODEL} 不支持图片，请切换到 gpt 或 claude]"
+    try:
+        with open(image_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
+        ext = Path(image_path).suffix.lower().strip(".")
+        mime = "jpeg" if ext in ("jpg", "jpeg") else ext
+
+        if context_lines:
+            context_block = "\n".join(context_lines)
+            text_part = f"以下是群里最近的聊天记录供你参考：\n{context_block}\n\n现在有人发了一张图片并问：{user_text or '请描述这张图片'}"
+        else:
+            text_part = user_text or "请描述这张图片"
+
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": [{"type": "text", "text": text_part}, {"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img_b64}"}}]}]
+        response = client.chat.completions.create(model=AI_MODEL, max_tokens=4096, messages=messages)
+        reply = response.choices[0].message.content
+        if session_id not in conversation_history:
+            conversation_history[session_id] = []
+        conversation_history[session_id].append({"role": "user", "content": text_part + " [附图]"})
+        conversation_history[session_id].append({"role": "assistant", "content": reply})
+        return reply
+    except Exception as e:
+        LOG.error(f"图片处理失败: {e}")
+        return f"[图片处理失败: {e}]"
+
+
+def ask_ai(session_id: str, user_text: str, context_lines: list = None) -> str:
+    if session_id not in conversation_history:
+        conversation_history[session_id] = []
+
+    if context_lines:
+        context_block = "\n".join(context_lines)
+        full_query = f"以下是群里最近的聊天记录供你参考：\n{context_block}\n\n现在有人问你：{user_text}"
+    else:
+        full_query = user_text
+
+    conversation_history[session_id].append({"role": "user", "content": full_query})
+
+    if len(conversation_history[session_id]) > 40:
+        conversation_history[session_id] = conversation_history[session_id][-40:]
+
+    try:
+        memory_block = memory_load_all()
+        system_content = SYSTEM_PROMPT
+        if memory_block:
+            system_content += f"\n\n以下是你需要记住的长期记忆：\n{memory_block}"
+        response = client.chat.completions.create(
+            model=AI_MODEL,
+            max_tokens=4096,
+            messages=[{"role": "system", "content": system_content}] + conversation_history[session_id],
+        )
+        reply = response.choices[0].message.content
+        conversation_history[session_id].append({"role": "assistant", "content": reply})
+        return reply
+    except Exception as e:
+        LOG.error(f"AI API 调用失败: {e}")
+        return f"[AI 暂时不可用: {e}]"
+
+
+def handle_msg(wcf: Wcf, msg: WxMsg):
+    try:
+        content = msg.content or ""
+        is_group = msg.from_group()
+        self_wxid = wcf.get_self_wxid()
+
+        LOG.debug(f"handle_msg: type={msg.type} is_group={is_group} roomid={msg.roomid} sender={msg.sender} is_at={msg.is_at(self_wxid)} content={content[:60]}")
+
+        if msg.from_self():
+            return
+
+        # 过滤公众号/服务号，防止回复死循环
+        if msg.sender.startswith("gh_") or msg.roomid.startswith("gh_"):
+            return
+
+        if is_group:
+            if GROUP_WHITELIST and group_whitelist_ids:
+                if msg.roomid not in group_whitelist_ids:
+                    return
+
+            is_at_me = msg.is_at(self_wxid)
+            session_id = msg.roomid
+            sender_name = wcf.get_alias_in_chatroom(msg.sender, msg.roomid) or msg.sender
+
+            # 旁听：普通文字消息存缓冲区
+            if msg.type == 1 and not is_at_me:
+                buf = group_context_buffer.setdefault(msg.roomid, [])
+                buf.append(f"{sender_name}: {content}")
+                if len(buf) > GROUP_CONTEXT_LIMIT:
+                    buf.pop(0)
+                return
+
+            # 图片消息：存 pending；若未 @bot 则旁听返回，否则继续触发
+            if msg.type == 3:
+                group_pending_media[msg.roomid] = {"type": "image", "msg": msg}
+                buf = group_context_buffer.setdefault(msg.roomid, [])
+                buf.append(f"{sender_name}: [发送了一张图片]")
+                if not is_at_me:
+                    return
+
+            # 文件消息(type=49)：存 pending；若未 @bot 则旁听返回，否则继续触发
+            if msg.type == 49:
+                try:
+                    root = ET.fromstring(content or "")
+                    filename = root.findtext(".//title") or ""
+                except Exception:
+                    filename = ""
+                buf = group_context_buffer.setdefault(msg.roomid, [])
+                buf.append(f"{sender_name}: [发送了文件 {filename or '附件'}]")
+                if filename:
+                    group_pending_media[msg.roomid] = {"type": "file", "filename": filename, "ts": msg.ts}
+                if not is_at_me:
+                    return
+
+            if not is_at_me:
+                if GROUP_TRIGGER_PREFIX and not content.startswith(GROUP_TRIGGER_PREFIX):
+                    return
+                elif not GROUP_TRIGGER_PREFIX:
+                    return
+
+            # === 以下是 @bot 触发后的处理 ===
+            query = content
+            if GROUP_TRIGGER_PREFIX and content.startswith(GROUP_TRIGGER_PREFIX):
+                query = content[len(GROUP_TRIGGER_PREFIX):].strip()
+            elif is_at_me:
+                at_tag = f"@{wcf.get_user_info()['name']}"
+                query = content.replace(at_tag, "").strip()
+
+            context_lines = group_context_buffer.pop(msg.roomid, [])
+            pending = group_pending_media.pop(msg.roomid, None)
+            LOG.info(f"群聊 [{msg.roomid}] 收到: {query[:60]}，上下文 {len(context_lines)} 条，pending={pending and pending['type']}")
+
+            # 有待处理图片
+            if pending and pending["type"] == "image":
+                pm = pending["msg"]
+                os.makedirs("D:\\Weixin\\bot\\downloads", exist_ok=True)
+                img_path = wcf.download_image(pm.id, pm.extra, "D:\\Weixin\\bot\\downloads", 30)
+                if img_path:
+                    LOG.info(f"图片已下载: {img_path}")
+                    reply = ask_ai_with_image(session_id, img_path, query, context_lines)
+                else:
+                    reply = "[图片下载失败，请重试]"
+                wcf.send_text(reply, msg.roomid, msg.sender)
+                return
+
+            # 有待处理文件：去微信缓存目录按文件名搜索
+            if pending and pending["type"] == "file":
+                filename = pending.get("filename", "")
+                found_path = None
+                for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
+                    for f in files:
+                        if f == filename:
+                            found_path = os.path.join(root_dir, f)
+                            break
+                    if found_path:
+                        break
+                if not found_path:
+                    wcf.send_text(f"[未找到文件《{filename}》，请确认文件已下载到本地]", msg.roomid, msg.sender)
+                    return
+                ext = Path(filename).suffix.lower()
+                if ext not in (".docx", ".md", ".pdf", ".txt"):
+                    wcf.send_text(f"[不支持 {ext}，支持 docx/md/pdf/txt]", msg.roomid, msg.sender)
+                    return
+                file_text = extract_file_text(found_path)
+                if not file_text:
+                    wcf.send_text(f"[文件《{filename}》内容为空或解析失败]", msg.roomid, msg.sender)
+                    return
+                LOG.info(f"读取文件 {filename}，{len(file_text)} 字符")
+                query = f"以下是文件《{filename}》的内容：\n{file_text[:100000]}\n\n{query or '请总结这个文件'}"
+
+        else:
+            if not PRIVATE_CHAT_REPLY:
+                return
+            if msg.type not in (1, 3, 49):
+                return
+            context_lines = []
+            session_id = msg.sender
+
+            if msg.type == 3:
+                time.sleep(1)
+                img_path = wcf.download_image(msg.id, msg.extra, "D:\\Weixin\\bot\\downloads", 10)
+                if img_path:
+                    reply = ask_ai_with_image(session_id, img_path, "", [])
+                else:
+                    reply = "[图片下载失败，请重试]"
+                wcf.send_text(reply, msg.sender)
+                return
+
+            query = content.strip()
+            LOG.info(f"私聊 [{msg.sender}] 收到: {query[:60]}")
+
+        if not query:
+            HELP_TEXT = (
+                "📋 可用指令：\n"
+                "\n"
+                "【文件】\n"
+                "总结文件 文件名[，问题]\n"
+                "读取文件 文件名[，问题]\n"
+                "分析文件 文件名[，问题]\n"
+                "翻译文件 文件名[，问题]\n"
+                "\n"
+                "【记忆】\n"
+                "列出记忆 / ls\n"
+                "记住 名字：内容\n"
+                "读取记忆 名字\n"
+                "删除记忆 名字\n"
+                "\n"
+                "【其他】\n"
+                "直接提问 → AI 回答\n"
+                "单独 @W. → 显示此帮助"
+            )
+            wcf.send_text(HELP_TEXT, msg.roomid if is_group else msg.sender)
+            return
+
+        # === 记忆指令拦截 ===
+        q = query.strip()
+
+        # 列出记忆
+        if q in ("列出记忆", "查看记忆", "ls", "ls memory"):
+            wcf.send_text(memory_list(), msg.roomid if is_group else msg.sender)
+            return
+
+        # 删除记忆：删除记忆 xxx
+        m = re.match(r'^删除记忆[：:\s]+(.+)$', q)
+        if m:
+            name = m.group(1).strip()
+            if memory_delete(name):
+                wcf.send_text(f"记忆 {name}.txt 已删除。", msg.roomid if is_group else msg.sender)
+            else:
+                wcf.send_text(f"未找到记忆 {name}.txt。", msg.roomid if is_group else msg.sender)
+            return
+
+        # 读取记忆：读取记忆 xxx
+        m = re.match(r'^读取记忆[：:\s]+(.+)$', q)
+        if m:
+            name = m.group(1).strip()
+            content = memory_read(name)
+            if content:
+                wcf.send_text(f"📄 {name}.txt：\n{content}", msg.roomid if is_group else msg.sender)
+            else:
+                wcf.send_text(f"未找到记忆 {name}.txt。", msg.roomid if is_group else msg.sender)
+            return
+
+        # 读取/总结文件：读取文件 xxx 或 总结文件 xxx[，附加问题]
+        m = re.match(r'^(读取|总结|分析|翻译)文件[\s：:]+(.+)$', q)
+        if m:
+            action = m.group(1).strip()
+            raw = m.group(2).strip()
+            # 逗号/句号后面的内容作为附加问题，前面才是文件名
+            parts = re.split(r'[，,。\s]{1,3}(?=[\u4e00-\u9fff])', raw, maxsplit=1)
+            filename = parts[0].strip()
+            extra_q = parts[1].strip() if len(parts) > 1 else ""
+            found_path = None
+            for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
+                for f in files:
+                    if f == filename or f.startswith(filename):
+                        found_path = os.path.join(root_dir, f)
+                        break
+                if found_path:
+                    break
+            if not found_path:
+                wcf.send_text(f"[未找到文件《{filename}》，请确认文件名正确]", msg.roomid if is_group else msg.sender)
+                return
+            ext = Path(found_path).suffix.lower()
+            if ext not in (".docx", ".md", ".pdf", ".txt"):
+                wcf.send_text(f"[不支持 {ext}，支持 docx/md/pdf/txt]", msg.roomid if is_group else msg.sender)
+                return
+            file_text = extract_file_text(found_path)
+            if not file_text:
+                wcf.send_text(f"[文件内容为空或解析失败]", msg.roomid if is_group else msg.sender)
+                return
+            LOG.info(f"读取文件 {found_path}，{len(file_text)} 字符")
+            task = extra_q if extra_q else f"请{action}这个文件"
+            query = f"以下是文件《{Path(found_path).name}》的内容：\n{file_text[:100000]}\n\n{task}"
+
+        # 保存记忆：记住 xxx（让AI生成内容保存）或 记住 名字：内容
+        m = re.match(r'^记住[：::\s]+([^：:]+)[：:](.+)$', q, re.DOTALL)
+        if m:
+            name = m.group(1).strip()
+            content = m.group(2).strip()
+            saved = memory_save(name, content)
+            wcf.send_text(f"相关记忆已保存到 {saved}。", msg.roomid if is_group else msg.sender)
+            return
+
+        time.sleep(0.5)
+        reply = ask_ai(session_id, query, context_lines if is_group else None)
+        LOG.info(f"回复 [{session_id}]: {reply[:80]}")
+
+        if is_group:
+            wcf.send_text(reply, msg.roomid, msg.sender)
+        else:
+            wcf.send_text(reply, msg.sender)
+
+    except Exception as e:
+        LOG.error(f"处理消息出错: {e}", exc_info=True)
+
+
+def safe_handle(wcf: Wcf, msg: WxMsg):
+    try:
+        handle_msg(wcf, msg)
+    except Exception as e:
+        LOG.error(f"handle_msg 未捕获异常: {e}", exc_info=True)
+
+
+def recv_loop(wcf: Wcf):
+    LOG.info("消息接收循环已启动")
+    while wcf.is_receiving_msg():
+        try:
+            msg = wcf.get_msg()
+            LOG.debug(f"收到原始消息 type={msg.type} roomid={msg.roomid} sender={msg.sender} content={str(msg.content)[:80]}")
+            Thread(target=safe_handle, args=(wcf, msg), daemon=True).start()
+        except Empty:
+            continue
+        except Exception as e:
+            LOG.error(f"接收消息出错: {e}", exc_info=True)
+
+
+def main():
+    LOG.info(f"正在启动 wcferry，AI 供应商: {AI_PROVIDER} ({AI_MODEL})")
+    LOG.info("请确保微信 3.9.x 已登录...")
+    wcf = Wcf()
+
+    try:
+        wcf.enable_receiving_msg()
+        LOG.info(f"微信连接成功，当前账号 wxid: {wcf.get_self_wxid()}")
+        info = wcf.get_user_info()
+        LOG.info(f"账号昵称: {info.get('name')}  微信号: {info.get('wxid')}")
+
+        if GROUP_WHITELIST:
+            contacts = wcf.get_contacts()
+            for c in contacts:
+                if c.get('name') in GROUP_WHITELIST:
+                    group_whitelist_ids.add(c.get('wxid'))
+                    LOG.info(f"白名单群: {c.get('name')} -> {c.get('wxid')}")
+            if not group_whitelist_ids:
+                LOG.warning(f"未找到白名单群 {GROUP_WHITELIST}，将监听所有群（请确认群名正确）")
+        else:
+            LOG.info("未设置 GROUP_WHITELIST，将响应所有群的触发词消息")
+
+        recv_loop(wcf)
+
+    except KeyboardInterrupt:
+        LOG.info("正在退出...")
+    finally:
+        try:
+            wcf.disable_receiving_msg()
+        except AttributeError:
+            pass
+        wcf.cleanup()
+
+
+if __name__ == "__main__":
+    main()

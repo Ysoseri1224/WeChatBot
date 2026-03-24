@@ -288,6 +288,42 @@ _watched_files: set = set()  # 已处理过的文件路径集合
 _file_convert_status: dict = {}  # stem -> {"status": "converting"/"done"/"error", "path": str, "md_path": str}
 _new_files_pending: list = []   # 断线期间检测到的新文件，重连后通知用户
 
+# ── 文件下载队列（持久化到磁盘，crash 后可恢复） ──
+PENDING_DL_PATH = MEMORY_DIR / "pending_downloads.json"
+
+
+def _save_pending_download(msg_id, thumb, extra, roomid, sender, filename):
+    """将 type=49 消息的下载信息追加到 JSON 文件（crash 前持久化）"""
+    try:
+        pending = json.loads(PENDING_DL_PATH.read_text(encoding="utf-8")) if PENDING_DL_PATH.exists() else []
+    except Exception:
+        pending = []
+    pending.append({
+        "msg_id": msg_id, "thumb": thumb, "extra": extra,
+        "roomid": roomid, "sender": sender, "filename": filename,
+        "ts": time.time()
+    })
+    PENDING_DL_PATH.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
+    LOG.info(f"[文件队列] 已保存待下载: {filename} (msg_id={msg_id})")
+
+
+def _load_pending_downloads():
+    """读取并清空待下载队列"""
+    if not PENDING_DL_PATH.exists():
+        return []
+    try:
+        pending = json.loads(PENDING_DL_PATH.read_text(encoding="utf-8"))
+        PENDING_DL_PATH.unlink(missing_ok=True)
+        return pending
+    except Exception:
+        return []
+
+
+def _extract_filename_from_xml(xml_str):
+    """从 type=49 消息的 XML 中提取文件名"""
+    m = re.search(r'<title>([^<]+)</title>', xml_str or "")
+    return m.group(1).strip() if m else ""
+
 
 def _file_watcher():
     """后台线程：轮询微信缓存目录，检测新文件并静默转换保存。
@@ -629,29 +665,40 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
         # 列出文件：列出文件 / ls文件 / 文件列表
         if q in ("列出文件", "ls文件", "文件列表", "ls files"):
             reply_to = msg.roomid if is_group else msg.sender
-            if not _file_convert_status:
-                # 也列出 FILE_SAVE_DIR 中已有的 md 文件
-                existing = [f.stem for f in FILE_SAVE_DIR.iterdir() if f.suffix == ".md"]
-                if existing:
-                    lines = [f"  ✅ {s}" for s in existing]
-                    wcf.send_text(f"📂 已保存的文件（{len(lines)} 个）：\n" + "\n".join(lines), reply_to)
-                else:
-                    wcf.send_text("[当前无已检测或已保存的文件]", reply_to)
+            seen_stems = set()
+            lines = []
+            status_map = {"converting": "⏳转化中", "done": "✅", "error": "❌"}
+            # 1) 转化状态中的文件
+            for stem, info in _file_convert_status.items():
+                s = status_map.get(info.get("status", ""), "❓")
+                lines.append(f"  {s} {info.get('name', stem)}")
+                seen_stems.add(stem)
+            # 2) FILE_SAVE_DIR 中已保存的 md 文件
+            for f in FILE_SAVE_DIR.iterdir():
+                if f.suffix == ".md" and f.stem not in seen_stems:
+                    lines.append(f"  ✅ {f.stem}")
+                    seen_stems.add(f.stem)
+            # 3) WECHAT_FILE_DIR 中可转化但尚未处理的文件（最近20个）
+            raw_files = []
+            for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
+                for f in files:
+                    p = Path(f)
+                    if p.suffix.lower() in CONVERTIBLE_EXTS and p.stem not in seen_stems:
+                        fp = os.path.join(root_dir, f)
+                        raw_files.append((f, os.path.getmtime(fp)))
+            raw_files.sort(key=lambda x: x[1], reverse=True)
+            for f, _ in raw_files[:20]:
+                lines.append(f"  📄 {f}")
+                seen_stems.add(Path(f).stem)
+            if lines:
+                wcf.send_text(f"📂 文件列表（{len(lines)} 个）：\n" + "\n".join(lines) + "\n\n✅=已转化可读取  📄=缓存中可读取\n用法：读取文件 文件名", reply_to)
             else:
-                status_map = {"converting": "⏳转化中", "done": "✅已完成", "error": "❌失败"}
-                lines = []
-                for stem, info in _file_convert_status.items():
-                    s = status_map.get(info.get("status", ""), "❓")
-                    lines.append(f"  {s} {info.get('name', stem)}")
-                # 补充 FILE_SAVE_DIR 中早期保存但不在 status 中的文件
-                for f in FILE_SAVE_DIR.iterdir():
-                    if f.suffix == ".md" and f.stem not in _file_convert_status:
-                        lines.append(f"  ✅ {f.name}")
-                wcf.send_text(f"📂 文件列表（{len(lines)} 个）：\n" + "\n".join(lines) + "\n\n已完成的可用：读取文件 文件名", reply_to)
+                wcf.send_text("[当前无已检测或已保存的文件]", reply_to)
             return
 
         # 读取/总结文件：读取文件 xxx 或 总结文件 xxx[，附加问题]
-        m = re.match(r'^(读取|总结|分析|翻译)文件[\s：:]+(.+)$', q)
+        # 支持自然语言变体：读取一下文件xxx、帮我读取文件xxx等
+        m = re.match(r'^(?:帮我|请)?\.?(读取|总结|分析|翻译)(?:一下)?文件[\s：:]+(.+)$', q)
         if m:
             action = m.group(1).strip()
             raw = m.group(2).strip()
@@ -739,8 +786,21 @@ def recv_loop(wcf: Wcf):
         try:
             msg = wcf.get_msg()
             empty_count = 0  # 收到消息，重置计数
-            # type=49(文件/链接)会导致微信crash，尽早丢弃，不访问任何其他属性
+            # type=49(文件/链接)会导致微信5-10秒后crash
+            # 在crash前尽快提取文件信息并持久化，重连后用download_attach下载
             if msg.type == 49:
+                try:
+                    filename = _extract_filename_from_xml(msg.content)
+                    ext = Path(filename).suffix.lower() if filename else ""
+                    if ext in CONVERTIBLE_EXTS:
+                        _save_pending_download(
+                            msg.id, msg.thumb, msg.extra,
+                            msg.roomid, msg.sender, filename
+                        )
+                    else:
+                        LOG.debug(f"type=49 非可转化文件({filename})，跳过")
+                except Exception as e:
+                    LOG.error(f"保存type=49消息信息失败: {e}")
                 continue
             LOG.debug(f"收到原始消息 type={msg.type} roomid={msg.roomid} sender={msg.sender} content={str(msg.content)[:80]}")
             Thread(target=safe_handle, args=(wcf, msg), daemon=True).start()
@@ -911,6 +971,86 @@ def _init_wcf():
     return wcf
 
 
+def _process_pending_downloads(wcf, pending):
+    """重连后处理 crash 前保存的待下载文件列表"""
+    for item in pending:
+        msg_id = item.get("msg_id")
+        thumb = item.get("thumb", "")
+        extra = item.get("extra", "")
+        roomid = item.get("roomid", "")
+        filename = item.get("filename", "未知文件")
+        reply_to = roomid if roomid else ""
+
+        if not reply_to:
+            LOG.warning(f"[文件恢复] 无 roomid，跳过: {filename}")
+            continue
+
+        LOG.info(f"[文件恢复] 正在下载: {filename} (msg_id={msg_id})")
+        try:
+            wcf.send_text(f"⏳ 正在恢复下载文件《{filename}》...", reply_to)
+            ret = wcf.download_attach(msg_id, thumb, extra)
+            if ret != 0:
+                LOG.warning(f"[文件恢复] download_attach 返回 {ret}，文件可能已下载或无法下载")
+
+            # 等待文件出现在缓存目录（最多30秒）
+            found_path = None
+            stem = Path(filename).stem
+            for _ in range(15):
+                time.sleep(2)
+                for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
+                    for f in files:
+                        if f == filename or (Path(f).stem.startswith(stem) and Path(f).suffix.lower() == Path(filename).suffix.lower()):
+                            candidate = os.path.join(root_dir, f)
+                            # 只匹配最近5分钟内修改的文件
+                            try:
+                                if time.time() - os.path.getmtime(candidate) < 300:
+                                    found_path = candidate
+                                    break
+                            except OSError:
+                                continue
+                    if found_path:
+                        break
+                if found_path:
+                    break
+
+            if not found_path:
+                LOG.warning(f"[文件恢复] 30秒内未找到文件: {filename}")
+                wcf.send_text(f"❌ 文件《{filename}》下载超时，请在微信中手动点击文件后重试", reply_to)
+                continue
+
+            LOG.info(f"[文件恢复] 找到文件: {found_path}")
+            # 复制到 FILE_SAVE_DIR 再处理
+            tmp_path = FILE_SAVE_DIR / Path(found_path).name
+            shutil.copy2(found_path, tmp_path)
+            md_text, was_converted = convert_to_markdown(str(tmp_path))
+            if tmp_path.suffix.lower() not in (".md", ".txt"):
+                tmp_path.unlink(missing_ok=True)
+
+            if not md_text:
+                wcf.send_text(f"❌ 文件《{filename}》解析失败（内容为空）", reply_to)
+                continue
+
+            save_path = FILE_SAVE_DIR / f"{Path(found_path).stem}.md"
+            save_path.write_text(md_text, encoding="utf-8")
+            _file_convert_status[Path(found_path).stem] = {
+                "status": "done", "path": found_path,
+                "md_path": str(save_path), "name": filename
+            }
+            LOG.info(f"[文件恢复] 转化完成: {save_path}，{len(md_text)} 字符")
+            wcf.send_text(
+                f"✅ 文件《{filename}》已恢复并转化（{len(md_text)} 字符）\n"
+                f"可用：读取文件 {Path(found_path).stem}",
+                reply_to
+            )
+
+        except Exception as e:
+            LOG.error(f"[文件恢复] 处理失败 {filename}: {e}", exc_info=True)
+            try:
+                wcf.send_text(f"❌ 文件《{filename}》恢复失败: {e}", reply_to)
+            except Exception:
+                pass
+
+
 def main():
     global _global_wcf, _file_watcher_started
     LOG.info(f"正在启动 wcferry，AI 供应商: {AI_PROVIDER} ({AI_MODEL})")
@@ -958,23 +1098,11 @@ def main():
                 _file_watcher_started = True
                 Thread(target=_file_watcher, daemon=True).start()
 
-            # 重连后：通知群里断线期间检测到的新文件
-            if _new_files_pending and group_whitelist_ids:
-                status_map = {"converting": "⏳转化中", "done": "✅已完成", "error": "❌失败"}
-                lines = []
-                for stem in _new_files_pending:
-                    info = _file_convert_status.get(stem, {})
-                    s = status_map.get(info.get("status", ""), "❓未知")
-                    name = info.get("name", stem)
-                    lines.append(f"  {s} {name}")
-                notice = f"📂 断线期间检测到 {len(lines)} 个新文件：\n" + "\n".join(lines)
-                notice += "\n\n已完成的文件可直接使用：读取文件 文件名"
-                for room_id in group_whitelist_ids:
-                    try:
-                        wcf.send_text(notice, room_id)
-                    except Exception:
-                        pass
-                _new_files_pending.clear()
+            # 重连后：处理 crash 前保存的待下载文件
+            pending = _load_pending_downloads()
+            if pending:
+                LOG.info(f"[文件恢复] 发现 {len(pending)} 个待下载文件")
+                Thread(target=_process_pending_downloads, args=(wcf, pending), daemon=True).start()
 
             recv_loop(wcf)
             # recv_loop 正常退出 = wcferry 断开（微信crash或退出）

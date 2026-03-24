@@ -790,7 +790,9 @@ def recv_loop(wcf: Wcf):
             # 在crash前尽快提取文件信息并持久化，重连后用download_attach下载
             if msg.type == 49:
                 try:
+                    LOG.info(f"[type=49] id={msg.id} thumb={msg.thumb!r} extra={msg.extra!r} content={str(msg.content)[:200]}")
                     filename = _extract_filename_from_xml(msg.content)
+                    LOG.info(f"[type=49] 提取文件名: {filename!r}")
                     ext = Path(filename).suffix.lower() if filename else ""
                     if ext in CONVERTIBLE_EXTS:
                         _save_pending_download(
@@ -1101,8 +1103,10 @@ def main():
             # 重连后：处理 crash 前保存的待下载文件
             pending = _load_pending_downloads()
             if pending:
-                LOG.info(f"[文件恢复] 发现 {len(pending)} 个待下载文件")
+                LOG.info(f"[文件恢复] 发现 {len(pending)} 个待下载文件: {[p.get('filename') for p in pending]}")
                 Thread(target=_process_pending_downloads, args=(wcf, pending), daemon=True).start()
+            else:
+                LOG.info("[文件恢复] 无待下载文件（pending_downloads.json 不存在或为空）")
 
             recv_loop(wcf)
             # recv_loop 正常退出 = wcferry 断开（微信crash或退出）

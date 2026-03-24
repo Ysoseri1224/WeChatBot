@@ -761,15 +761,38 @@ def recv_loop(wcf: Wcf):
 
 
 def _auto_click_login():
-    """后台线程：持续监控微信登录窗口，出现则自动点击登录按钮。"""
+    """后台线程：监控微信登录窗口自动点击登录，同时监控 WxInitSDK 注入失败弹窗自动关闭。"""
     try:
-        from pywinauto import Application
+        from pywinauto import Application, Desktop
     except ImportError:
         LOG.warning("[自动登录] pywinauto 未安装，跳过")
         return
     LOG.info("[自动登录] 后台监控已启动，等待登录窗口...")
-    for _ in range(60):  # 最多等60秒
+    login_clicked = False
+    for _ in range(60):
         try:
+            # 优先检测"注入失败"弹窗并自动关闭
+            try:
+                for win in Desktop(backend='uia').windows():
+                    if 'WxInitSDK' in win.window_text() or '注入失败' in win.window_text():
+                        try:
+                            btn = win.child_window(title='确定', control_type='Button')
+                            if btn.exists(timeout=0):
+                                btn.click_input()
+                                LOG.warning("[自动登录] 已关闭「注入失败」弹窗")
+                        except Exception:
+                            try:
+                                win.close()
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+            if login_clicked:
+                time.sleep(1)
+                continue
+
+            # 检测微信登录窗口
             app = Application(backend='uia').connect(path='WeChat.exe', timeout=2)
             dlg = app.window(title='微信')
             if not dlg.exists(timeout=1):
@@ -781,21 +804,22 @@ def _auto_click_login():
                     if btn.exists(timeout=1):
                         btn.click_input()
                         LOG.info(f"[自动登录] 已点击「{btn_name}」按钮")
-                        return
+                        login_clicked = True
+                        break
                 except Exception:
                     continue
-            # 兜底：发 Enter
-            try:
-                dlg.set_focus()
-                import pywinauto.keyboard as kb
-                kb.send_keys('{ENTER}')
-                LOG.info("[自动登录] 已发送 Enter 键")
-                return
-            except Exception:
-                pass
+            if not login_clicked:
+                try:
+                    dlg.set_focus()
+                    import pywinauto.keyboard as kb
+                    kb.send_keys('{ENTER}')
+                    LOG.info("[自动登录] 已发送 Enter 键")
+                    login_clicked = True
+                except Exception:
+                    pass
         except Exception:
             time.sleep(1)
-    LOG.warning("[自动登录] 60秒内未检测到登录窗口")
+    LOG.info("[自动登录] 监控线程结束")
 
 
 def _kill_wechat():
@@ -828,10 +852,26 @@ def _kill_wechat():
     LOG.info("[清理] 已结束所有微信相关进程并释放端口")
 
 
+class _WcfInitError(Exception):
+    """Wcf() 初始化失败（注入失败或连接失败）时抛出，防止 os._exit 杀死进程"""
+    pass
+
+
 def _init_wcf():
-    """初始化 wcferry 连接，解析白名单群，返回 Wcf 实例"""
+    """初始化 wcferry 连接，解析白名单群，返回 Wcf 实例。
+    Monkey-patch os._exit 防止 wcferry 注入失败时杀死整个进程，改为可重试的异常。"""
     global _global_wcf
-    wcf = Wcf()
+    _real_exit = os._exit
+
+    def _fake_exit(code):
+        raise _WcfInitError(f"wcferry 调用了 os._exit({code})，已拦截")
+
+    os._exit = _fake_exit
+    try:
+        wcf = Wcf()
+    finally:
+        os._exit = _real_exit  # 无论成功失败都恢复
+
     wcf.enable_receiving_msg()
     _global_wcf = wcf
     LOG.info(f"微信连接成功，当前账号 wxid: {wcf.get_self_wxid()}")

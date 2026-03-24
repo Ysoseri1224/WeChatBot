@@ -238,6 +238,12 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                     filename = root.findtext(".//title") or ""
                 except Exception:
                     filename = ""
+                ext = Path(filename).suffix.lower() if filename else ""
+                if ext and ext not in (".docx", ".md", ".pdf", ".txt"):
+                    LOG.debug(f"忽略不支持的文件类型: {filename}")
+                    buf = group_context_buffer.setdefault(msg.roomid, [])
+                    buf.append(f"{sender_name}: [发送了文件 {filename}（不支持）]")
+                    return
                 buf = group_context_buffer.setdefault(msg.roomid, [])
                 buf.append(f"{sender_name}: [发送了文件 {filename or '附件'}]")
                 if filename:
@@ -339,14 +345,23 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 "删除记忆 名字\n"
                 "\n"
                 "【其他】\n"
+                "clear / 重置 → 清除对话上下文\n"
                 "直接提问 → AI 回答\n"
-                "单独 @W. → 显示此帮助"
+                "单独 @bot → 显示此帮助"
             )
             wcf.send_text(HELP_TEXT, msg.roomid if is_group else msg.sender)
             return
 
         # === 记忆指令拦截 ===
         q = query.strip()
+
+        # 清除上下文
+        if q in ("clear", "清除上下文", "清空上下文", "重置"):
+            conversation_history.pop(session_id, None)
+            group_context_buffer.pop(msg.roomid, None) if is_group else None
+            group_pending_media.pop(msg.roomid, None) if is_group else None
+            wcf.send_text("上下文已清除。", msg.roomid if is_group else msg.sender)
+            return
 
         # 列出记忆
         if q in ("列出记忆", "查看记忆", "ls", "ls memory"):

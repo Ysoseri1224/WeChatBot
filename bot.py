@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from queue import Empty
-from threading import Thread, Lock
+from threading import Thread
 from dotenv import load_dotenv
 from openai import OpenAI
 from wcferry import Wcf, WxMsg
@@ -51,8 +51,7 @@ client = OpenAI(api_key=_api_key, base_url=_base_url)
 conversation_history: dict = {}
 group_whitelist_ids: set = set()
 group_context_buffer: dict = {}   # roomid -> list of "昵称: 内容" 字符串
-group_pending_media: dict = {}    # roomid -> {"type": "image"|"file", "msg": WxMsg, "filename": str}
-_file_process_lock = Lock()       # 防止多文件并发处理导致crash
+group_pending_media: dict = {}    # roomid -> {"type": "image", "msg": WxMsg}
 _global_wcf = None                # 全局wcf引用，供文件监控线程使用
 _file_watcher_started = False     # 文件监控线程是否已启动
 GROUP_CONTEXT_LIMIT = int(os.getenv("GROUP_CONTEXT_LIMIT", "50"))  # 最多保留条数
@@ -227,73 +226,6 @@ def convert_to_markdown(filepath: str) -> tuple[str, bool]:
 def extract_file_text(filepath: str) -> str:
     text, _ = convert_to_markdown(filepath)
     return text
-
-
-def _process_incoming_file(wcf: Wcf, filename: str, extra_path: str, reply_target: str):
-    """收到文件后异步执行：等待文件落盘，转换为 MD 并保存，回复结果"""
-    with _file_process_lock:  # 串行处理，防止并发crash
-        # 规范化路径，去除多余空白和不可见字符
-        extra_path = os.path.normpath(extra_path.strip()) if extra_path else ""
-        extra_dir = str(Path(extra_path).parent) if extra_path else ""
-        stem = Path(filename).stem
-        ext_lower = Path(filename).suffix.lower()
-        LOG.info(f"[文件处理] 等待文件落盘: {filename} extra={extra_path}")
-
-        def _find_file():
-            # 1. 直接用 extra 路径
-            if extra_path and os.path.isfile(extra_path):
-                return extra_path
-            # 2. 在 extra 同目录下按文件名搜索
-            if extra_dir and os.path.isdir(extra_dir):
-                for f in os.listdir(extra_dir):
-                    fp = os.path.join(extra_dir, f)
-                    if os.path.isfile(fp) and f.lower().endswith(ext_lower) and Path(f).stem.startswith(stem):
-                        return fp
-            # 3. 全局搜索 WECHAT_FILE_DIR
-            for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
-                for f in files:
-                    if f == filename or (f.lower().endswith(ext_lower) and Path(f).stem.startswith(stem)):
-                        candidate = os.path.join(root_dir, f)
-                        try:
-                            if time.time() - os.path.getmtime(candidate) < 120:
-                                return candidate
-                        except OSError:
-                            continue
-            return None
-
-        found_path = None
-        for i in range(15):  # 最多等30秒
-            found_path = _find_file()
-            if found_path:
-                LOG.info(f"[文件处理] 第{i+1}次扫描找到: {found_path}")
-                break
-            time.sleep(2)
-
-        if not found_path:
-            LOG.warning(f"[文件处理] 30秒超时未找到: {filename} (extra={extra_path})")
-            wcf.send_text(f"[文件《{filename}》下载超时，请重新发送]", reply_target)
-            return
-
-        ext = Path(filename).suffix.lower()
-        if ext not in CONVERTIBLE_EXTS:
-            wcf.send_text(f"[文件格式 {ext} 暂不支持，无法保存]", reply_target)
-            return
-
-        LOG.info(f"开始转换文件: {found_path}")
-        md_text, was_converted = convert_to_markdown(found_path)
-        if not md_text:
-            wcf.send_text(f"[文件《{filename}》解析失败，内容为空]", reply_target)
-            return
-
-        stem = Path(filename).stem
-        save_path = FILE_SAVE_DIR / f"{stem}.md"
-        save_path.write_text(md_text, encoding="utf-8")
-        LOG.info(f"文件已保存: {save_path}，{len(md_text)} 字符")
-
-        if was_converted:
-            wcf.send_text(f"✅ 此文件格式已转换并保存为 {stem}.md\n可用：读取文件 {stem}", reply_target)
-        else:
-            wcf.send_text(f"✅ 此文件格式支持，已保存 {stem}.md\n可用：读取文件 {stem}", reply_target)
 
 
 _watched_files: set = set()  # 已处理过的文件路径集合
@@ -776,52 +708,6 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 wcf.send_text(reply, msg.roomid, msg.sender)
                 return
 
-            # 有待处理文件：download_attach + 读取内容 → 直接发 AI
-            if pending and pending["type"] == "file":
-                pm = pending["msg"]
-                filename = pending.get("filename", "")
-                LOG.info(f"[文件] @bot 触发，处理待读文件: {filename}")
-                # 再次触发下载（确保文件落盘）
-                try:
-                    wcf.download_attach(pm.id, pm.thumb, pm.extra)
-                except Exception as e:
-                    LOG.warning(f"[文件] download_attach: {e}")
-                # 等文件出现（最多15秒）
-                found_path = None
-                stem = Path(filename).stem
-                ext_lower = Path(filename).suffix.lower()
-                for _ in range(5):
-                    # 1. extra 路径
-                    if pm.extra and os.path.isfile(pm.extra):
-                        found_path = pm.extra
-                        break
-                    # 2. WECHAT_FILE_DIR 全局搜
-                    for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
-                        for f in files:
-                            if f == filename or (Path(f).stem.startswith(stem) and Path(f).suffix.lower() == ext_lower):
-                                candidate = os.path.join(root_dir, f)
-                                try:
-                                    if time.time() - os.path.getmtime(candidate) < 120:
-                                        found_path = candidate
-                                        break
-                                except OSError:
-                                    continue
-                        if found_path:
-                            break
-                    if found_path:
-                        break
-                    time.sleep(3)
-                if not found_path:
-                    wcf.send_text(f"[文件《{filename}》尚未下载完成，请稍后重试]", msg.roomid, msg.sender)
-                    return
-                LOG.info(f"[文件] 找到: {found_path}")
-                file_text = extract_file_text(found_path)
-                if not file_text:
-                    wcf.send_text(f"[文件《{filename}》内容为空或解析失败]", msg.roomid, msg.sender)
-                    return
-                LOG.info(f"[文件] 读取 {filename}，{len(file_text)} 字符，发给 AI")
-                query = f"以下是文件《{filename}》的内容：\n{file_text[:100000]}\n\n{query or '请总结这个文件'}"
-
         else:
             if not PRIVATE_CHAT_REPLY:
                 return
@@ -1002,83 +888,125 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 wcf.send_text("[当前无已检测或已保存的文件]", reply_to)
             return
 
-        # 读取/总结文件：读取文件 xxx 或 总结文件 xxx[，附加问题]
-        # 支持自然语言变体：读取一下文件xxx、帮我读取文件xxx等
-        LOG.info(f"[指令匹配] q={q[:80]!r}")
-        m = re.match(r'^(?:帮我|请)?\.?(读取|总结|分析|翻译)(?:一下)?文件[\s：:]+(.+)$', q)
-        if not m:
-            # 备用：更宽松匹配（允许前缀杂字符）
-            m = re.search(r'(读取|总结|分析|翻译)文件[\s：:]+(.+)$', q)
-            if m:
-                LOG.info(f"[指令匹配] 备用regex命中: action={m.group(1)} file={m.group(2)[:40]}")
+        # 读取/总结文件：读取文件 xxx 或 总结文件 xxx[，问题]
+        m = re.match(r'^(读取|总结|分析|翻译)文件[\s：:]+(.+)$', q)
         if m:
             action = m.group(1).strip()
             raw = m.group(2).strip()
             reply_to = msg.roomid if is_group else msg.sender
-            # 逗号/句号后面的内容作为附加问题，前面才是文件名
-            parts = re.split(r'[，,。\s]{1,3}(?=[\u4e00-\u9fff])', raw, maxsplit=1)
+            # 逗号后面的内容作为附加问题，前面才是文件名
+            parts = re.split(r'[，,]+', raw, maxsplit=1)
             filename = parts[0].strip()
             extra_q = parts[1].strip() if len(parts) > 1 else ""
+            LOG.info(f"[读取文件] 搜索: {filename!r}")
 
-            # 先检查转化状态
-            for stem, info in _file_convert_status.items():
-                if stem == filename or stem.startswith(filename) or filename in stem:
-                    if info["status"] == "converting":
-                        wcf.send_text(f"⏳ 文件《{info.get('name', stem)}》正在转化中，请稍后再试", reply_to)
-                        return
-                    elif info["status"] == "error":
-                        wcf.send_text(f"❌ 文件《{info.get('name', stem)}》转化失败，无法读取", reply_to)
-                        return
-                    break
+            # ---------- 收集所有匹配 ----------
+            candidates = []  # [(display_name, full_path, mtime, source)]
+            seen_paths = set()
 
-            found_path = None
-            # 优先搜已转换保存的 FILE_SAVE_DIR（.md 文件）
-            for f in FILE_SAVE_DIR.iterdir():
-                if f.stem == filename or f.name == filename or f.stem.startswith(filename) or f.name.startswith(filename):
-                    found_path = str(f)
-                    break
-            # 再搜微信缓存原始文件
-            if not found_path:
-                for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
-                    for f in files:
-                        if f == filename or f.startswith(filename):
-                            found_path = os.path.join(root_dir, f)
-                            break
-                    if found_path:
-                        break
-            if not found_path:
-                # 本地没找到，尝试从微信DB按需下载
-                wcf.send_text(f"⏳ 正在从微信下载《{filename}》...", reply_to)
-                found_path = _try_download_from_db(wcf, filename)
-                if found_path:
-                    # 下载成功，复制并转化保存
-                    tmp_path = FILE_SAVE_DIR / Path(found_path).name
-                    shutil.copy2(found_path, tmp_path)
-                    md_text, _ = convert_to_markdown(str(tmp_path))
-                    if tmp_path.suffix.lower() not in (".md", ".txt"):
-                        tmp_path.unlink(missing_ok=True)
-                    if md_text:
-                        save_path = FILE_SAVE_DIR / f"{Path(found_path).stem}.md"
-                        save_path.write_text(md_text, encoding="utf-8")
-                        found_path = str(save_path)
-                        LOG.info(f"[按需下载] 转化保存: {save_path}")
-                    else:
-                        wcf.send_text(f"❌ 文件《{filename}》下载后解析失败", reply_to)
-                        return
-                else:
-                    wcf.send_text(f"[未找到文件《{filename}》，请确认文件名正确，或文件已过期]", reply_to)
+            def _add(path_str, source):
+                rp = os.path.normpath(path_str)
+                if rp in seen_paths:
                     return
-            ext = Path(found_path).suffix.lower()
-            if ext not in CONVERTIBLE_EXTS and ext != ".md":
-                wcf.send_text(f"[不支持 {ext} 格式]", reply_to)
+                seen_paths.add(rp)
+                try:
+                    mt = os.path.getmtime(rp)
+                except OSError:
+                    mt = 0
+                candidates.append((Path(rp).name, rp, mt, source))
+
+            # ① FILE_SAVE_DIR（已转化的 .md/.txt 才算）
+            cached_stems = set()
+            if FILE_SAVE_DIR.exists():
+                for f in FILE_SAVE_DIR.iterdir():
+                    if f.suffix.lower() not in (".md", ".txt"):
+                        continue
+                    if f.stem == filename or f.name == filename or f.stem.startswith(filename):
+                        _add(str(f), "已转化")
+                        cached_stems.add(f.stem)
+
+            # ② WECHAT_FILE_DIR（微信本地缓存，跳过已有缓存MD的）
+            for root_dir, _dirs, files in os.walk(WECHAT_FILE_DIR):
+                for f in files:
+                    if f == filename or f.startswith(filename) or Path(f).stem == filename:
+                        fp = os.path.join(root_dir, f)
+                        ext_l = Path(f).suffix.lower()
+                        if ext_l in CONVERTIBLE_EXTS and Path(f).stem not in cached_stems:
+                            _add(fp, "本地缓存")
+
+            # ③ DB 尝试（失败不抛异常）
+            if not candidates:
+                try:
+                    db_path = _try_download_from_db(wcf, filename)
+                    if db_path:
+                        _add(db_path, "微信下载")
+                except Exception as e:
+                    LOG.warning(f"[读取文件] DB下载尝试失败: {e}")
+
+            if not candidates:
+                wcf.send_text(f"[未找到文件《{filename}》，请确认文件名或重新发送]", reply_to)
                 return
-            file_text = extract_file_text(found_path)
-            if not file_text:
-                wcf.send_text(f"[文件内容为空或解析失败]", reply_to)
+
+            # ---------- 多匹配：列出让用户选 ----------
+            if len(candidates) > 1:
+                lines = []
+                for name, path, mt, src in sorted(candidates, key=lambda x: x[2], reverse=True):
+                    ts = time.strftime("%m-%d %H:%M", time.localtime(mt)) if mt else "未知"
+                    lines.append(f"  [{src}] {name}  ({ts})")
+                wcf.send_text(
+                    f"🔍 找到 {len(candidates)} 个匹配《{filename}》的文件：\n"
+                    + "\n".join(lines)
+                    + "\n\n请用更精确的文件名重试，如：\n读取文件 完整文件名.docx",
+                    reply_to
+                )
                 return
-            LOG.info(f"读取文件 {found_path}，{len(file_text)} 字符")
-            task = extra_q if extra_q else f"请{action}这个文件"
-            query = f"以下是文件《{Path(found_path).name}》的内容：\n{file_text[:100000]}\n\n{task}"
+
+            # ---------- 单匹配：读取 ----------
+            chosen_name, chosen_path, _, chosen_src = candidates[0]
+            ext = Path(chosen_path).suffix.lower()
+            LOG.info(f"[读取文件] 命中: {chosen_path} ({chosen_src})")
+
+            # 如果已是 .md/.txt，直接读
+            if ext in (".md", ".txt"):
+                file_text = Path(chosen_path).read_text(encoding="utf-8", errors="replace")
+            else:
+                # 检查是否已有缓存的 .md
+                cached_md = FILE_SAVE_DIR / f"{Path(chosen_path).stem}.md"
+                if cached_md.exists():
+                    file_text = cached_md.read_text(encoding="utf-8", errors="replace")
+                    LOG.info(f"[读取文件] 使用缓存MD: {cached_md}")
+                else:
+                    # 转化并缓存
+                    tmp_path = FILE_SAVE_DIR / Path(chosen_path).name
+                    try:
+                        shutil.copy2(chosen_path, tmp_path)
+                    except Exception as e:
+                        wcf.send_text(f"[文件复制失败: {e}]", reply_to)
+                        return
+                    file_text, _ = convert_to_markdown(str(tmp_path))
+                    if tmp_path.suffix.lower() not in (".md", ".txt"):
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except PermissionError:
+                            LOG.debug(f"[读取文件] 临时文件删除失败(文件锁): {tmp_path}")
+                    if file_text:
+                        cached_md.write_text(file_text, encoding="utf-8")
+                        LOG.info(f"[读取文件] 转化并缓存: {cached_md} ({len(file_text)} 字符)")
+                    else:
+                        wcf.send_text(f"[文件《{chosen_name}》解析失败，格式可能不支持]", reply_to)
+                        return
+
+            if not file_text or not file_text.strip():
+                wcf.send_text(f"[文件《{chosen_name}》内容为空]", reply_to)
+                return
+            LOG.info(f"[读取文件] {chosen_name}，{len(file_text)} 字符，发给AI")
+            task = extra_q if extra_q else f"请{action}这个文件的内容"
+            query = (
+                f"用户上传了文件《{chosen_name}》，以下是该文件的完整文本内容（已由系统提取）。"
+                f"请直接基于这些内容回答，不要说你无法读取文件。\n\n"
+                f"──── 文件内容 ────\n{file_text[:100000]}\n──── 文件结束 ────\n\n"
+                f"用户的要求：{task}"
+            )
 
         # 保存记忆：记住 xxx（让AI生成内容保存）或 记住 名字：内容
         m = re.match(r'^记住[：::\s]+([^：:]+)[：:](.+)$', q, re.DOTALL)

@@ -228,7 +228,7 @@ def extract_file_text(filepath: str) -> str:
 def _process_incoming_file(wcf: Wcf, filename: str, file_ts: int, reply_target: str, sender_name: str):
     """收到文件后异步执行：等待文件出现在缓存目录，转换为MD并保存，回复结果"""
     found_path = None
-    for _ in range(10):  # 最多等10秒
+    for _ in range(30):  # 最多等30秒
         for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
             for f in files:
                 if f == filename:
@@ -376,6 +376,13 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                     filename = root.findtext(".//title") or ""
                 except Exception:
                     filename = ""
+                # content 无法解析时，尝试从 extra 字段提取文件名
+                if not filename and msg.extra:
+                    extra_name = Path(msg.extra).name
+                    if extra_name and '.' in extra_name:
+                        filename = extra_name
+                        LOG.debug(f"type=49 从 extra 获取文件名: {filename}")
+                LOG.debug(f"type=49 filename={filename!r} extra={str(msg.extra)[:80]}")
                 buf = group_context_buffer.setdefault(msg.roomid, [])
                 if not filename:
                     buf.append(f"{sender_name}: [发送了附件（无法识别文件名）]")

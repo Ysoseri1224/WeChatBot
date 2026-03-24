@@ -225,25 +225,21 @@ def extract_file_text(filepath: str) -> str:
     return text
 
 
-def _process_incoming_file(wcf: Wcf, filename: str, file_ts: int, reply_target: str, sender_name: str):
-    """收到文件后异步执行：等待文件出现在缓存目录，转换为MD并保存，回复结果"""
+def _process_incoming_file(wcf: Wcf, filename: str, extra_path: str, reply_target: str):
+    """收到文件后异步执行：直接用 extra 路径读取文件，转换为 MD 并保存，回复结果"""
+    # 优先用 extra 直接路径，如果不存在则轮询等待
     found_path = None
-    for _ in range(30):  # 最多等30秒
-        for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
-            for f in files:
-                if f == filename:
-                    fpath = os.path.join(root_dir, f)
-                    if os.path.getmtime(fpath) >= file_ts - 5:
-                        found_path = fpath
-                        break
-            if found_path:
+    if extra_path and Path(extra_path).exists():
+        found_path = extra_path
+    else:
+        for _ in range(30):
+            if extra_path and Path(extra_path).exists():
+                found_path = extra_path
                 break
-        if found_path:
-            break
-        time.sleep(1)
+            time.sleep(1)
 
     if not found_path:
-        LOG.warning(f"文件未在缓存目录找到: {filename}")
+        LOG.warning(f"文件未找到: {filename} (extra={extra_path})")
         return
 
     ext = Path(filename).suffix.lower()
@@ -376,28 +372,23 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                     filename = root.findtext(".//title") or ""
                 except Exception:
                     filename = ""
-                # content 无法解析时，尝试从 extra 字段提取文件名
-                if not filename and msg.extra:
-                    extra_name = Path(msg.extra).name
-                    if extra_name and '.' in extra_name:
-                        filename = extra_name
-                        LOG.debug(f"type=49 从 extra 获取文件名: {filename}")
-                LOG.debug(f"type=49 filename={filename!r} extra={str(msg.extra)[:80]}")
+                # extra 字段就是文件完整路径，优先从中提取文件名
+                extra_path = msg.extra or ""
+                if not filename and extra_path:
+                    filename = Path(extra_path).name
+                LOG.debug(f"type=49 filename={filename!r} extra={extra_path[:80]}")
                 buf = group_context_buffer.setdefault(msg.roomid, [])
                 if not filename:
                     buf.append(f"{sender_name}: [发送了附件（无法识别文件名）]")
                     if not is_at_me:
                         return
                 else:
-                    ext = Path(filename).suffix.lower()
                     buf.append(f"{sender_name}: [发送了文件 {filename}]")
                     reply_target = msg.roomid
-                    _fn, _ts, _rt, _sn = filename, msg.ts, reply_target, sender_name
                     Thread(target=_process_incoming_file,
-                           args=(wcf, _fn, _ts, _rt, _sn),
+                           args=(wcf, filename, extra_path, reply_target),
                            daemon=True).start()
-                    if filename:
-                        group_pending_media[msg.roomid] = {"type": "file", "filename": filename, "ts": msg.ts}
+                    group_pending_media[msg.roomid] = {"type": "file", "filename": filename, "ts": msg.ts, "path": extra_path}
                     if not is_at_me:
                         return
 

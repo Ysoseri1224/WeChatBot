@@ -917,25 +917,29 @@ def main():
     LOG.info("请确保微信 3.9.x 已登录...")
 
     RECONNECT_INTERVAL = 10  # 断开后每隔10秒尝试重连
+    WECHAT_EXE = os.getenv("WECHAT_EXE", r"D:\vx3.9\WeChat\WeChat.exe")
     MAX_INJECT_RETRIES = 3   # 注入最多尝试次数
 
     while True:
         wcf = None
         try:
-            # 多次尝试注入：第一次直接注入（微信可能已在运行），失败后杀进程重试
             for attempt in range(1, MAX_INJECT_RETRIES + 1):
                 Thread(target=_auto_click_login, daemon=True).start()
+                if attempt > 1:
+                    # 第2次起：彻底清理 → 手动启动微信 → 等登录完成
+                    _kill_wechat()
+                    LOG.info(f"[注入] 手动启动微信: {WECHAT_EXE}")
+                    subprocess.Popen([WECHAT_EXE], shell=False)
+                    LOG.info("[注入] 等待微信启动和登录（30秒）...")
+                    time.sleep(30)  # 等微信完全初始化
                 try:
                     LOG.info(f"[注入] 第 {attempt}/{MAX_INJECT_RETRIES} 次尝试...")
                     wcf = _init_wcf()
                     break  # 注入成功
                 except _WcfInitError as e:
                     LOG.warning(f"[注入] 第 {attempt} 次失败: {e}")
-                    if attempt < MAX_INJECT_RETRIES:
-                        LOG.info("[注入] 清理环境后重试...")
-                        _kill_wechat()
-                    else:
-                        raise  # 最后一次仍然失败，抛给外层
+                    if attempt >= MAX_INJECT_RETRIES:
+                        raise
 
             # 文件监控线程只启动一次（使用 _global_wcf，重连后自动跟随）
             if not _file_watcher_started:

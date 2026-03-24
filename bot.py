@@ -484,6 +484,7 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 "记住 名字：内容\n"
                 "读取记忆 名字\n"
                 "删除记忆 名字\n"
+                "导入文件为记忆 文件名[，记忆名]\n"
                 "\n"
                 "【其他】\n"
                 "clear / 重置 → 清除对话上下文\n"
@@ -528,6 +529,38 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 wcf.send_text(f"📄 {name}.txt：\n{content}", msg.roomid if is_group else msg.sender)
             else:
                 wcf.send_text(f"未找到记忆 {name}.txt。", msg.roomid if is_group else msg.sender)
+            return
+
+        # 导入文件为记忆：导入文件为记忆 文件名[，记忆名]
+        m = re.match(r'^导入文件为记忆[\s：:]+(.+)$', q)
+        if m:
+            raw = m.group(1).strip()
+            parts = re.split(r'[，,]\s*', raw, maxsplit=1)
+            src_name = parts[0].strip()
+            mem_name = parts[1].strip() if len(parts) > 1 else Path(src_name).stem
+            # 搜索顺序：FILE_SAVE_DIR → 微信缓存
+            found_path = None
+            for f in FILE_SAVE_DIR.iterdir():
+                if f.stem == src_name or f.name == src_name or f.stem.startswith(src_name) or f.name.startswith(src_name):
+                    found_path = str(f)
+                    break
+            if not found_path:
+                for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
+                    for f in files:
+                        if f == src_name or f.startswith(src_name):
+                            found_path = os.path.join(root_dir, f)
+                            break
+                    if found_path:
+                        break
+            if not found_path:
+                wcf.send_text(f"[未找到文件《{src_name}》]", msg.roomid if is_group else msg.sender)
+                return
+            file_text = extract_file_text(found_path)
+            if not file_text:
+                wcf.send_text(f"[文件内容为空或解析失败]", msg.roomid if is_group else msg.sender)
+                return
+            memory_save(mem_name, file_text)
+            wcf.send_text(f"✅ 已将《{Path(found_path).name}》保存为记忆「{mem_name}」（{len(file_text)} 字符）", msg.roomid if is_group else msg.sender)
             return
 
         # 读取/总结文件：读取文件 xxx 或 总结文件 xxx[，附加问题]

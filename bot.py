@@ -705,7 +705,7 @@ def safe_handle(wcf: Wcf, msg: WxMsg):
 def recv_loop(wcf: Wcf):
     LOG.info("消息接收循环已启动")
     empty_count = 0
-    HEARTBEAT_INTERVAL = 60  # 连续60次Empty（约30秒）后检测一次心跳
+    HEARTBEAT_INTERVAL = 10  # 连续10次Empty后检测心跳
     while wcf.is_receiving_msg():
         try:
             msg = wcf.get_msg()
@@ -719,11 +719,14 @@ def recv_loop(wcf: Wcf):
             empty_count += 1
             if empty_count >= HEARTBEAT_INTERVAL:
                 empty_count = 0
-                try:
-                    wcf.get_self_wxid()
-                except Exception as e:
-                    LOG.warning(f"心跳检测失败，微信可能已断开: {e}")
-                    return  # 退出recv_loop，触发main()中的重连逻辑
+                # 心跳：检查 WeChat.exe 进程是否存活（比 wcf API 快得多）
+                result = subprocess.run(
+                    ["tasklist", "/FI", "IMAGENAME eq WeChat.exe", "/NH"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if "WeChat.exe" not in result.stdout:
+                    LOG.warning("心跳检测：WeChat.exe 进程不存在，微信已退出")
+                    return
         except Exception as e:
             LOG.error(f"接收消息出错: {e}", exc_info=True)
 

@@ -3,6 +3,7 @@ import re
 import time
 import base64
 import logging
+import subprocess
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +57,9 @@ VISION_PROVIDERS = {"gpt", "claude"}  # 支持图片的供应商
 WECHAT_FILE_DIR = os.getenv("WECHAT_FILE_DIR", r"D:\WeChat Files\wxid_amkb0miro4hf22\FileStorage\File")
 MEMORY_DIR = Path(os.getenv("MEMORY_DIR", r"D:\Weixin\bot\memory"))
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+FILE_SAVE_DIR = MEMORY_DIR / "files"
+FILE_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+SOFFICE_PATH = os.getenv("SOFFICE_PATH", r"C:\Program Files\LibreOffice\program\soffice.exe")
 
 
 def memory_load_all() -> str:
@@ -110,24 +114,158 @@ def memory_read(name: str) -> str:
     return ""
 
 
-def extract_file_text(filepath: str) -> str:
-    ext = Path(filepath).suffix.lower()
+CONVERTIBLE_EXTS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf", ".txt", ".md"}
+LIBRE_NEEDED_EXTS = {".doc", ".ppt", ".xls"}
+
+
+def _soffice_convert(src: Path, out_dir: Path, fmt: str = "docx") -> Path | None:
+    if not Path(SOFFICE_PATH).exists():
+        LOG.warning(f"LibreOffice 未找到: {SOFFICE_PATH}")
+        return None
     try:
-        if ext == ".md" or ext == ".txt":
-            return Path(filepath).read_text(encoding="utf-8", errors="ignore")
+        subprocess.run(
+            [SOFFICE_PATH, "--headless", "--convert-to", fmt, "--outdir", str(out_dir), str(src)],
+            timeout=60, capture_output=True
+        )
+        stem = src.stem
+        result = out_dir / f"{stem}.{fmt}"
+        return result if result.exists() else None
+    except Exception as e:
+        LOG.error(f"LibreOffice 转换失败: {e}")
+        return None
+
+
+def convert_to_markdown(filepath: str) -> tuple[str, bool]:
+    """返回 (markdown文本, 是否经过转换)。转换=原格式非原生支持"""
+    p = Path(filepath)
+    ext = p.suffix.lower()
+    converted = False
+    try:
+        # .doc/.ppt/.xls → LibreOffice 先转
+        if ext in LIBRE_NEEDED_EXTS:
+            converted = True
+            fmt_map = {".doc": "docx", ".ppt": "pptx", ".xls": "xlsx"}
+            target_fmt = fmt_map[ext]
+            new_p = _soffice_convert(p, p.parent, target_fmt)
+            if new_p is None:
+                return "", converted
+            p = new_p
+            ext = p.suffix.lower()
+
+        if ext in (".txt", ".md"):
+            return p.read_text(encoding="utf-8", errors="ignore"), converted
+
         elif ext == ".docx":
             import docx
-            doc = docx.Document(filepath)
-            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            doc = docx.Document(str(p))
+            lines = []
+            for para in doc.paragraphs:
+                if not para.text.strip():
+                    continue
+                style = para.style.name.lower() if para.style else ""
+                if "heading 1" in style:
+                    lines.append(f"# {para.text}")
+                elif "heading 2" in style:
+                    lines.append(f"## {para.text}")
+                elif "heading 3" in style:
+                    lines.append(f"### {para.text}")
+                else:
+                    lines.append(para.text)
+            for table in doc.tables:
+                rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+                if rows:
+                    lines.append("| " + " | ".join(rows[0]) + " |")
+                    lines.append("|" + "---|" * len(rows[0]))
+                    for row in rows[1:]:
+                        lines.append("| " + " | ".join(row) + " |")
+            return "\n".join(lines), converted
+
+        elif ext in (".xlsx",):
+            import openpyxl
+            wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
+            lines = []
+            for sheet in wb.sheetnames:
+                ws = wb[sheet]
+                lines.append(f"## Sheet: {sheet}")
+                for row in ws.iter_rows(values_only=True):
+                    cells = [str(c) if c is not None else "" for c in row]
+                    if any(cells):
+                        lines.append("| " + " | ".join(cells) + " |")
+            return "\n".join(lines), converted
+
+        elif ext == ".pptx":
+            from pptx import Presentation
+            prs = Presentation(str(p))
+            lines = []
+            for i, slide in enumerate(prs.slides, 1):
+                lines.append(f"## 第 {i} 页")
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        for para in shape.text_frame.paragraphs:
+                            text = para.text.strip()
+                            if text:
+                                lines.append(text)
+            return "\n".join(lines), converted
+
         elif ext == ".pdf":
             import fitz
-            doc = fitz.open(filepath)
-            return "\n".join(page.get_text() for page in doc)
+            doc = fitz.open(str(p))
+            return "\n".join(page.get_text() for page in doc), converted
+
         else:
-            return ""
+            return "", converted
+
     except Exception as e:
-        LOG.error(f"文件解析失败 {filepath}: {e}")
-        return ""
+        LOG.error(f"文件转换失败 {filepath}: {e}")
+        return "", converted
+
+
+def extract_file_text(filepath: str) -> str:
+    text, _ = convert_to_markdown(filepath)
+    return text
+
+
+def _process_incoming_file(wcf: Wcf, filename: str, file_ts: int, reply_target: str, sender_name: str):
+    """收到文件后异步执行：等待文件出现在缓存目录，转换为MD并保存，回复结果"""
+    found_path = None
+    for _ in range(10):  # 最多等10秒
+        for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
+            for f in files:
+                if f == filename:
+                    fpath = os.path.join(root_dir, f)
+                    if os.path.getmtime(fpath) >= file_ts - 5:
+                        found_path = fpath
+                        break
+            if found_path:
+                break
+        if found_path:
+            break
+        time.sleep(1)
+
+    if not found_path:
+        LOG.warning(f"文件未在缓存目录找到: {filename}")
+        return
+
+    ext = Path(filename).suffix.lower()
+    if ext not in CONVERTIBLE_EXTS:
+        wcf.send_text(f"[文件格式 {ext} 暂不支持，无法保存]", reply_target)
+        return
+
+    LOG.info(f"开始转换文件: {found_path}")
+    md_text, was_converted = convert_to_markdown(found_path)
+    if not md_text:
+        wcf.send_text(f"[文件《{filename}》解析失败，内容为空]", reply_target)
+        return
+
+    stem = Path(filename).stem
+    save_path = FILE_SAVE_DIR / f"{stem}.md"
+    save_path.write_text(md_text, encoding="utf-8")
+    LOG.info(f"文件已保存: {save_path}，{len(md_text)} 字符")
+
+    if was_converted:
+        wcf.send_text(f"✅ 此文件格式已转换并保存为 {stem}.md\n可用：读取文件 {stem}", reply_target)
+    else:
+        wcf.send_text(f"✅ 此文件格式支持，已保存 {stem}.md\n可用：读取文件 {stem}", reply_target)
 
 
 def ask_ai_with_image(session_id: str, image_path: str, user_text: str, context_lines: list = None) -> str:
@@ -231,25 +369,30 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 if not is_at_me:
                     return
 
-            # 文件消息(type=49)：存 pending；若未 @bot 则旁听返回，否则继续触发
+            # 文件消息(type=49)：立即异步处理保存，存 pending 供后续 @bot 使用
             if msg.type == 49:
                 try:
                     root = ET.fromstring(content or "")
                     filename = root.findtext(".//title") or ""
                 except Exception:
                     filename = ""
-                ext = Path(filename).suffix.lower() if filename else ""
-                if ext and ext not in (".docx", ".md", ".pdf", ".txt"):
-                    LOG.debug(f"忽略不支持的文件类型: {filename}")
-                    buf = group_context_buffer.setdefault(msg.roomid, [])
-                    buf.append(f"{sender_name}: [发送了文件 {filename}（不支持）]")
-                    return
                 buf = group_context_buffer.setdefault(msg.roomid, [])
-                buf.append(f"{sender_name}: [发送了文件 {filename or '附件'}]")
-                if filename:
-                    group_pending_media[msg.roomid] = {"type": "file", "filename": filename, "ts": msg.ts}
-                if not is_at_me:
-                    return
+                if not filename:
+                    buf.append(f"{sender_name}: [发送了附件（无法识别文件名）]")
+                    if not is_at_me:
+                        return
+                else:
+                    ext = Path(filename).suffix.lower()
+                    buf.append(f"{sender_name}: [发送了文件 {filename}]")
+                    reply_target = msg.roomid
+                    _fn, _ts, _rt, _sn = filename, msg.ts, reply_target, sender_name
+                    Thread(target=_process_incoming_file,
+                           args=(wcf, _fn, _ts, _rt, _sn),
+                           daemon=True).start()
+                    if filename:
+                        group_pending_media[msg.roomid] = {"type": "file", "filename": filename, "ts": msg.ts}
+                    if not is_at_me:
+                        return
 
             if not is_at_me:
                 if GROUP_TRIGGER_PREFIX and not content.startswith(GROUP_TRIGGER_PREFIX):
@@ -399,19 +542,26 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
             filename = parts[0].strip()
             extra_q = parts[1].strip() if len(parts) > 1 else ""
             found_path = None
-            for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
-                for f in files:
-                    if f == filename or f.startswith(filename):
-                        found_path = os.path.join(root_dir, f)
-                        break
-                if found_path:
+            # 优先搜已转换保存的 FILE_SAVE_DIR（.md 文件）
+            for f in FILE_SAVE_DIR.iterdir():
+                if f.stem == filename or f.name == filename or f.stem.startswith(filename) or f.name.startswith(filename):
+                    found_path = str(f)
                     break
+            # 再搜微信缓存原始文件
+            if not found_path:
+                for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
+                    for f in files:
+                        if f == filename or f.startswith(filename):
+                            found_path = os.path.join(root_dir, f)
+                            break
+                    if found_path:
+                        break
             if not found_path:
                 wcf.send_text(f"[未找到文件《{filename}》，请确认文件名正确]", msg.roomid if is_group else msg.sender)
                 return
             ext = Path(found_path).suffix.lower()
-            if ext not in (".docx", ".md", ".pdf", ".txt"):
-                wcf.send_text(f"[不支持 {ext}，支持 docx/md/pdf/txt]", msg.roomid if is_group else msg.sender)
+            if ext not in CONVERTIBLE_EXTS:
+                wcf.send_text(f"[不支持 {ext} 格式]", msg.roomid if is_group else msg.sender)
                 return
             file_text = extract_file_text(found_path)
             if not file_text:

@@ -285,14 +285,15 @@ def _process_incoming_file(wcf: Wcf, filename: str, extra_path: str, reply_targe
 
 
 _watched_files: set = set()  # 已处理过的文件路径集合
+_file_convert_status: dict = {}  # stem -> {"status": "converting"/"done"/"error", "path": str, "md_path": str}
+_new_files_pending: list = []   # 断线期间检测到的新文件，重连后通知用户
 
 
 def _file_watcher():
-    """后台线程：轮询微信缓存目录，检测新文件并自动转换保存。
-    使用 _global_wcf 发送通知，即使 wcf 重连后也能正常工作。"""
+    """后台线程：轮询微信缓存目录，检测新文件并静默转换保存。
+    转换状态记录到 _file_convert_status，新文件记录到 _new_files_pending。"""
     global _global_wcf
     LOG.info(f"[文件监控] 线程启动，监控目录: {WECHAT_FILE_DIR}")
-    # 初始化：记录启动时已有的文件，避免处理旧文件
     start_time = time.time()
     for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
         for f in files:
@@ -301,13 +302,12 @@ def _file_watcher():
 
     while True:
         try:
-            time.sleep(5)  # 每5秒扫描一次
+            time.sleep(5)
             for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
                 for f in files:
                     fp = os.path.join(root_dir, f)
                     if fp in _watched_files:
                         continue
-                    # 只处理启动后出现的新文件
                     try:
                         mtime = os.path.getmtime(fp)
                     except OSError:
@@ -318,41 +318,32 @@ def _file_watcher():
                     _watched_files.add(fp)
                     ext = Path(f).suffix.lower()
                     if ext not in CONVERTIBLE_EXTS:
-                        LOG.debug(f"[文件监控] 跳过不支持的格式: {f}")
                         continue
-                    # 等待文件写入完成（微信可能还在下载）
+                    stem = Path(f).stem
+                    # 标记为转化中
+                    _file_convert_status[stem] = {"status": "converting", "path": fp, "md_path": "", "name": f}
+                    _new_files_pending.append(stem)
+                    LOG.info(f"[文件监控] 检测到新文件: {f}，开始静默转化")
+                    # 等待文件写入完成
                     time.sleep(2)
-                    LOG.info(f"[文件监控] 检测到新文件: {f}")
                     try:
-                        # 复制到临时位置再处理，不锁定原始文件
                         tmp_path = FILE_SAVE_DIR / f
                         shutil.copy2(fp, tmp_path)
                         md_text, was_converted = convert_to_markdown(str(tmp_path))
-                        # 删除临时副本（非md的）
                         if tmp_path.suffix.lower() not in (".md", ".txt"):
                             tmp_path.unlink(missing_ok=True)
                         if not md_text:
                             LOG.warning(f"[文件监控] 文件解析为空: {f}")
+                            _file_convert_status[stem]["status"] = "error"
                             continue
-                        stem = Path(f).stem
                         save_path = FILE_SAVE_DIR / f"{stem}.md"
                         save_path.write_text(md_text, encoding="utf-8")
-                        LOG.info(f"[文件监控] 已保存: {save_path}，{len(md_text)} 字符")
-                        # 通知白名单群（仅在 wcf 可用时）
-                        wcf = _global_wcf
-                        if wcf and group_whitelist_ids:
-                            try:
-                                for room_id in group_whitelist_ids:
-                                    if was_converted:
-                                        wcf.send_text(f"✅ 检测到新文件，已转换并保存为 {stem}.md\n可用：读取文件 {stem}", room_id)
-                                    else:
-                                        wcf.send_text(f"✅ 检测到新文件，已保存 {stem}.md\n可用：读取文件 {stem}", room_id)
-                            except Exception as e:
-                                LOG.warning(f"[文件监控] 发送通知失败（wcf可能断开）: {e}")
-                        else:
-                            LOG.info(f"[文件监控] wcf未就绪，跳过通知，文件已保存到 {save_path}")
+                        _file_convert_status[stem]["status"] = "done"
+                        _file_convert_status[stem]["md_path"] = str(save_path)
+                        LOG.info(f"[文件监控] 转化完成: {save_path}，{len(md_text)} 字符")
                     except Exception as e:
-                        LOG.error(f"[文件监控] 处理文件失败 {f}: {e}", exc_info=True)
+                        LOG.error(f"[文件监控] 转化失败 {f}: {e}", exc_info=True)
+                        _file_convert_status[stem]["status"] = "error"
         except Exception as e:
             LOG.error(f"[文件监控] 扫描异常: {e}", exc_info=True)
             time.sleep(5)
@@ -545,6 +536,7 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 "📋 可用指令：\n"
                 "\n"
                 "【文件】\n"
+                "列出文件 / ls文件\n"
                 "总结文件 文件名[，问题]\n"
                 "读取文件 文件名[，问题]\n"
                 "分析文件 文件名[，问题]\n"
@@ -634,15 +626,52 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
             wcf.send_text(f"✅ 已将《{Path(found_path).name}》保存为记忆「{mem_name}」（{len(file_text)} 字符）", msg.roomid if is_group else msg.sender)
             return
 
+        # 列出文件：列出文件 / ls文件 / 文件列表
+        if q in ("列出文件", "ls文件", "文件列表", "ls files"):
+            reply_to = msg.roomid if is_group else msg.sender
+            if not _file_convert_status:
+                # 也列出 FILE_SAVE_DIR 中已有的 md 文件
+                existing = [f.stem for f in FILE_SAVE_DIR.iterdir() if f.suffix == ".md"]
+                if existing:
+                    lines = [f"  ✅ {s}" for s in existing]
+                    wcf.send_text(f"📂 已保存的文件（{len(lines)} 个）：\n" + "\n".join(lines), reply_to)
+                else:
+                    wcf.send_text("[当前无已检测或已保存的文件]", reply_to)
+            else:
+                status_map = {"converting": "⏳转化中", "done": "✅已完成", "error": "❌失败"}
+                lines = []
+                for stem, info in _file_convert_status.items():
+                    s = status_map.get(info.get("status", ""), "❓")
+                    lines.append(f"  {s} {info.get('name', stem)}")
+                # 补充 FILE_SAVE_DIR 中早期保存但不在 status 中的文件
+                for f in FILE_SAVE_DIR.iterdir():
+                    if f.suffix == ".md" and f.stem not in _file_convert_status:
+                        lines.append(f"  ✅ {f.name}")
+                wcf.send_text(f"📂 文件列表（{len(lines)} 个）：\n" + "\n".join(lines) + "\n\n已完成的可用：读取文件 文件名", reply_to)
+            return
+
         # 读取/总结文件：读取文件 xxx 或 总结文件 xxx[，附加问题]
         m = re.match(r'^(读取|总结|分析|翻译)文件[\s：:]+(.+)$', q)
         if m:
             action = m.group(1).strip()
             raw = m.group(2).strip()
+            reply_to = msg.roomid if is_group else msg.sender
             # 逗号/句号后面的内容作为附加问题，前面才是文件名
             parts = re.split(r'[，,。\s]{1,3}(?=[\u4e00-\u9fff])', raw, maxsplit=1)
             filename = parts[0].strip()
             extra_q = parts[1].strip() if len(parts) > 1 else ""
+
+            # 先检查转化状态
+            for stem, info in _file_convert_status.items():
+                if stem == filename or stem.startswith(filename) or filename in stem:
+                    if info["status"] == "converting":
+                        wcf.send_text(f"⏳ 文件《{info.get('name', stem)}》正在转化中，请稍后再试", reply_to)
+                        return
+                    elif info["status"] == "error":
+                        wcf.send_text(f"❌ 文件《{info.get('name', stem)}》转化失败，无法读取", reply_to)
+                        return
+                    break
+
             found_path = None
             # 优先搜已转换保存的 FILE_SAVE_DIR（.md 文件）
             for f in FILE_SAVE_DIR.iterdir():
@@ -659,15 +688,15 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                     if found_path:
                         break
             if not found_path:
-                wcf.send_text(f"[未找到文件《{filename}》，请确认文件名正确]", msg.roomid if is_group else msg.sender)
+                wcf.send_text(f"[未找到文件《{filename}》，请确认文件名正确]", reply_to)
                 return
             ext = Path(found_path).suffix.lower()
             if ext not in CONVERTIBLE_EXTS:
-                wcf.send_text(f"[不支持 {ext} 格式]", msg.roomid if is_group else msg.sender)
+                wcf.send_text(f"[不支持 {ext} 格式]", reply_to)
                 return
             file_text = extract_file_text(found_path)
             if not file_text:
-                wcf.send_text(f"[文件内容为空或解析失败]", msg.roomid if is_group else msg.sender)
+                wcf.send_text(f"[文件内容为空或解析失败]", reply_to)
                 return
             LOG.info(f"读取文件 {found_path}，{len(file_text)} 字符")
             task = extra_q if extra_q else f"请{action}这个文件"
@@ -771,6 +800,24 @@ def main():
             if not _file_watcher_started:
                 _file_watcher_started = True
                 Thread(target=_file_watcher, daemon=True).start()
+
+            # 重连后：通知群里断线期间检测到的新文件
+            if _new_files_pending and group_whitelist_ids:
+                status_map = {"converting": "⏳转化中", "done": "✅已完成", "error": "❌失败"}
+                lines = []
+                for stem in _new_files_pending:
+                    info = _file_convert_status.get(stem, {})
+                    s = status_map.get(info.get("status", ""), "❓未知")
+                    name = info.get("name", stem)
+                    lines.append(f"  {s} {name}")
+                notice = f"📂 断线期间检测到 {len(lines)} 个新文件：\n" + "\n".join(lines)
+                notice += "\n\n已完成的文件可直接使用：读取文件 文件名"
+                for room_id in group_whitelist_ids:
+                    try:
+                        wcf.send_text(notice, room_id)
+                    except Exception:
+                        pass
+                _new_files_pending.clear()
 
             recv_loop(wcf)
             # recv_loop 正常退出 = wcferry 断开（微信crash或退出）

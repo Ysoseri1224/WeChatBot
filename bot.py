@@ -118,7 +118,7 @@ CONVERTIBLE_EXTS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf", "
 LIBRE_NEEDED_EXTS = {".doc", ".ppt", ".xls"}
 
 
-def _soffice_convert(src: Path, out_dir: Path, fmt: str = "docx") -> Path | None:
+def _soffice_convert(src: Path, out_dir: Path, fmt: str = "docx"):
     if not Path(SOFFICE_PATH).exists():
         LOG.warning(f"LibreOffice 未找到: {SOFFICE_PATH}")
         return None

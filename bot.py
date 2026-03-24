@@ -824,6 +824,15 @@ def _auto_click_login():
 
 def _kill_wechat():
     """强制结束所有 WeChat 相关进程 + 释放 wcferry 端口，确保注入前环境干净"""
+    # 第一轮：wmic 删除所有 WeChat 相关进程（比 taskkill 更彻底）
+    try:
+        subprocess.run(
+            ['wmic', 'process', 'where', "name like '%WeChat%'", 'delete'],
+            capture_output=True, timeout=10
+        )
+    except Exception:
+        pass
+    # 第二轮：taskkill 兜底
     for proc_name in ["WeChat.exe", "WeChatUtility.exe", "WeChatPlayer.exe",
                        "WeChatBrowser.exe", "WeChatAppEx.exe"]:
         try:
@@ -848,8 +857,18 @@ def _kill_wechat():
                         LOG.info(f"[清理] 已杀死占用端口 {port} 的进程 PID={pid}")
         except Exception:
             pass
-    time.sleep(3)
-    LOG.info("[清理] 已结束所有微信相关进程并释放端口")
+    # 等待进程完全退出
+    time.sleep(5)
+    # 验证是否清理干净
+    r = subprocess.run(
+        ["tasklist", "/FI", "IMAGENAME eq WeChat.exe", "/NH"],
+        capture_output=True, text=True, timeout=5
+    )
+    if "WeChat.exe" in r.stdout:
+        LOG.warning("[清理] WeChat.exe 仍在运行，再次强杀...")
+        subprocess.run(["taskkill", "/F", "/IM", "WeChat.exe"], capture_output=True, timeout=5)
+        time.sleep(3)
+    LOG.info("[清理] 微信进程和端口清理完成")
 
 
 class _WcfInitError(Exception):
@@ -898,14 +917,25 @@ def main():
     LOG.info("请确保微信 3.9.x 已登录...")
 
     RECONNECT_INTERVAL = 10  # 断开后每隔10秒尝试重连
+    MAX_INJECT_RETRIES = 3   # 注入最多尝试次数
 
     while True:
         wcf = None
         try:
-            _kill_wechat()  # 确保注入前没有残留进程
-            # 后台线程监控登录窗口并自动点击（Wcf()会自己启动微信）
-            Thread(target=_auto_click_login, daemon=True).start()
-            wcf = _init_wcf()
+            # 多次尝试注入：第一次直接注入（微信可能已在运行），失败后杀进程重试
+            for attempt in range(1, MAX_INJECT_RETRIES + 1):
+                Thread(target=_auto_click_login, daemon=True).start()
+                try:
+                    LOG.info(f"[注入] 第 {attempt}/{MAX_INJECT_RETRIES} 次尝试...")
+                    wcf = _init_wcf()
+                    break  # 注入成功
+                except _WcfInitError as e:
+                    LOG.warning(f"[注入] 第 {attempt} 次失败: {e}")
+                    if attempt < MAX_INJECT_RETRIES:
+                        LOG.info("[注入] 清理环境后重试...")
+                        _kill_wechat()
+                    else:
+                        raise  # 最后一次仍然失败，抛给外层
 
             # 文件监控线程只启动一次（使用 _global_wcf，重连后自动跟随）
             if not _file_watcher_started:

@@ -763,8 +763,16 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
             if GROUP_TRIGGER_PREFIX and content.startswith(GROUP_TRIGGER_PREFIX):
                 query = content[len(GROUP_TRIGGER_PREFIX):].strip()
             elif is_at_me:
-                at_tag = f"@{wcf.get_user_info()['name']}"
-                query = content.replace(at_tag, "").strip()
+                try:
+                    at_tag = f"@{wcf.get_user_info()['name']}"
+                except Exception:
+                    at_tag = ""
+                if at_tag and at_tag in content:
+                    query = content.replace(at_tag, "").strip()
+                else:
+                    # 备用：用regex去掉 @xxx 前缀
+                    query = re.sub(r'^@\S+\s*', '', content).strip()
+            LOG.info(f"[剥离] content={content[:60]!r} → query={query[:60]!r}")
 
             context_lines = group_context_buffer.pop(msg.roomid, [])
             pending = group_pending_media.pop(msg.roomid, None)
@@ -1011,7 +1019,13 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
 
         # 读取/总结文件：读取文件 xxx 或 总结文件 xxx[，附加问题]
         # 支持自然语言变体：读取一下文件xxx、帮我读取文件xxx等
+        LOG.info(f"[指令匹配] q={q[:80]!r}")
         m = re.match(r'^(?:帮我|请)?\.?(读取|总结|分析|翻译)(?:一下)?文件[\s：:]+(.+)$', q)
+        if not m:
+            # 备用：更宽松匹配（允许前缀杂字符）
+            m = re.search(r'(读取|总结|分析|翻译)文件[\s：:]+(.+)$', q)
+            if m:
+                LOG.info(f"[指令匹配] 备用regex命中: action={m.group(1)} file={m.group(2)[:40]}")
         if m:
             action = m.group(1).strip()
             raw = m.group(2).strip()

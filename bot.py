@@ -692,6 +692,9 @@ def recv_loop(wcf: Wcf):
     while wcf.is_receiving_msg():
         try:
             msg = wcf.get_msg()
+            # type=49(文件/链接)会导致微信crash，尽早丢弃，不访问任何其他属性
+            if msg.type == 49:
+                continue
             LOG.debug(f"收到原始消息 type={msg.type} roomid={msg.roomid} sender={msg.sender} content={str(msg.content)[:80]}")
             Thread(target=safe_handle, args=(wcf, msg), daemon=True).start()
         except Empty:

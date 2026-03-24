@@ -230,36 +230,48 @@ def extract_file_text(filepath: str) -> str:
 
 
 def _process_incoming_file(wcf: Wcf, filename: str, extra_path: str, reply_target: str):
-    """收到文件后异步执行：直接用 extra 路径读取文件，转换为 MD 并保存，回复结果"""
+    """收到文件后异步执行：等待文件落盘，转换为 MD 并保存，回复结果"""
     with _file_process_lock:  # 串行处理，防止并发crash
         # 规范化路径，去除多余空白和不可见字符
         extra_path = os.path.normpath(extra_path.strip()) if extra_path else ""
         extra_dir = str(Path(extra_path).parent) if extra_path else ""
+        stem = Path(filename).stem
+        ext_lower = Path(filename).suffix.lower()
+        LOG.info(f"[文件处理] 等待文件落盘: {filename} extra={extra_path}")
 
         def _find_file():
             # 1. 直接用 extra 路径
             if extra_path and os.path.isfile(extra_path):
                 return extra_path
-            # 2. 在 extra 同目录下按文件名（含前缀匹配）搜索
+            # 2. 在 extra 同目录下按文件名搜索
             if extra_dir and os.path.isdir(extra_dir):
-                stem = Path(filename).stem
-                ext = Path(filename).suffix.lower()
                 for f in os.listdir(extra_dir):
                     fp = os.path.join(extra_dir, f)
-                    if os.path.isfile(fp) and f.lower().endswith(ext) and Path(f).stem.startswith(stem):
-                        LOG.debug(f"兜底找到文件: {fp}")
+                    if os.path.isfile(fp) and f.lower().endswith(ext_lower) and Path(f).stem.startswith(stem):
                         return fp
+            # 3. 全局搜索 WECHAT_FILE_DIR
+            for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
+                for f in files:
+                    if f == filename or (f.lower().endswith(ext_lower) and Path(f).stem.startswith(stem)):
+                        candidate = os.path.join(root_dir, f)
+                        try:
+                            if time.time() - os.path.getmtime(candidate) < 120:
+                                return candidate
+                        except OSError:
+                            continue
             return None
 
         found_path = None
-        for _ in range(5):
+        for i in range(15):  # 最多等30秒
             found_path = _find_file()
             if found_path:
+                LOG.info(f"[文件处理] 第{i+1}次扫描找到: {found_path}")
                 break
-            time.sleep(1)
+            time.sleep(2)
 
         if not found_path:
-            LOG.warning(f"文件未找到: {filename} (extra={extra_path})")
+            LOG.warning(f"[文件处理] 30秒超时未找到: {filename} (extra={extra_path})")
+            wcf.send_text(f"[文件《{filename}》下载超时，请重新发送]", reply_target)
             return
 
         ext = Path(filename).suffix.lower()
@@ -720,17 +732,19 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 if not is_at_me:
                     return
 
-            # 文件消息(type=49)：实时下载+转化（crash前5-10秒窗口足够处理）
+            # 文件消息(type=49)：实时下载+转化
             if msg.type == 49:
+                LOG.info(f"[文件] type=49 到达 handle_msg: id={msg.id} extra={msg.extra!r} thumb={msg.thumb!r} content前100字={str(msg.content)[:100]}")
                 filename = _extract_filename_from_xml(msg.content)
                 ext = Path(filename).suffix.lower() if filename else ""
+                LOG.info(f"[文件] 提取文件名={filename!r} ext={ext!r}")
                 if ext in CONVERTIBLE_EXTS:
-                    LOG.info(f"[文件] 收到可转化文件: {filename} (id={msg.id})")
                     reply_target = msg.roomid if is_group else msg.sender
-                    # 先触发下载
+                    wcf.send_text(f"📥 检测到文件《{filename}》，正在下载...", reply_target)
+                    # 触发下载
                     try:
                         ret = wcf.download_attach(msg.id, msg.thumb, msg.extra)
-                        LOG.info(f"[文件] download_attach 返回: {ret}")
+                        LOG.info(f"[文件] download_attach(id={msg.id}) 返回: {ret}")
                     except Exception as e:
                         LOG.error(f"[文件] download_attach 失败: {e}")
                     # 异步处理文件（等待落盘+转化+保存）
@@ -739,8 +753,6 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                         args=(wcf, filename, msg.extra, reply_target),
                         daemon=True
                     ).start()
-                else:
-                    LOG.debug(f"type=49 非可转化文件({filename!r})，跳过")
                 return
 
             if not is_at_me:

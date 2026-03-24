@@ -789,8 +789,8 @@ def _ensure_wechat_running():
                 btn = dlg.child_window(title=btn_name, control_type='Button')
                 if btn.exists(timeout=1):
                     btn.click_input()
-                    LOG.info(f"[自动登录] 已点击「{btn_name}」按钮")
-                    time.sleep(3)
+                    LOG.info(f"[自动登录] 已点击「{btn_name}」按钮，等待微信初始化...")
+                    time.sleep(15)  # 微信登录后需要较长时间加载
                     return
             except Exception:
                 continue

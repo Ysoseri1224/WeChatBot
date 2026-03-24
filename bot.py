@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from queue import Empty
-from threading import Thread
+from threading import Thread, Lock
 from dotenv import load_dotenv
 from openai import OpenAI
 from wcferry import Wcf, WxMsg
@@ -51,6 +51,7 @@ conversation_history: dict = {}
 group_whitelist_ids: set = set()
 group_context_buffer: dict = {}   # roomid -> list of "昵称: 内容" 字符串
 group_pending_media: dict = {}    # roomid -> {"type": "image"|"file", "msg": WxMsg, "filename": str}
+_file_process_lock = Lock()       # 防止多文件并发处理导致crash
 GROUP_CONTEXT_LIMIT = int(os.getenv("GROUP_CONTEXT_LIMIT", "50"))  # 最多保留条数
 
 VISION_PROVIDERS = {"gpt", "claude"}  # 支持图片的供应商
@@ -227,56 +228,57 @@ def extract_file_text(filepath: str) -> str:
 
 def _process_incoming_file(wcf: Wcf, filename: str, extra_path: str, reply_target: str):
     """收到文件后异步执行：直接用 extra 路径读取文件，转换为 MD 并保存，回复结果"""
-    # 规范化路径，去除多余空白和不可见字符
-    extra_path = os.path.normpath(extra_path.strip()) if extra_path else ""
-    extra_dir = str(Path(extra_path).parent) if extra_path else ""
+    with _file_process_lock:  # 串行处理，防止并发crash
+        # 规范化路径，去除多余空白和不可见字符
+        extra_path = os.path.normpath(extra_path.strip()) if extra_path else ""
+        extra_dir = str(Path(extra_path).parent) if extra_path else ""
 
-    def _find_file():
-        # 1. 直接用 extra 路径
-        if extra_path and os.path.isfile(extra_path):
-            return extra_path
-        # 2. 在 extra 同目录下按文件名（含前缀匹配）搜索
-        if extra_dir and os.path.isdir(extra_dir):
-            stem = Path(filename).stem
-            ext = Path(filename).suffix.lower()
-            for f in os.listdir(extra_dir):
-                fp = os.path.join(extra_dir, f)
-                if os.path.isfile(fp) and f.lower().endswith(ext) and Path(f).stem.startswith(stem):
-                    LOG.debug(f"兜底找到文件: {fp}")
-                    return fp
-        return None
+        def _find_file():
+            # 1. 直接用 extra 路径
+            if extra_path and os.path.isfile(extra_path):
+                return extra_path
+            # 2. 在 extra 同目录下按文件名（含前缀匹配）搜索
+            if extra_dir and os.path.isdir(extra_dir):
+                stem = Path(filename).stem
+                ext = Path(filename).suffix.lower()
+                for f in os.listdir(extra_dir):
+                    fp = os.path.join(extra_dir, f)
+                    if os.path.isfile(fp) and f.lower().endswith(ext) and Path(f).stem.startswith(stem):
+                        LOG.debug(f"兜底找到文件: {fp}")
+                        return fp
+            return None
 
-    found_path = None
-    for _ in range(30):
-        found_path = _find_file()
-        if found_path:
-            break
-        time.sleep(1)
+        found_path = None
+        for _ in range(30):
+            found_path = _find_file()
+            if found_path:
+                break
+            time.sleep(1)
 
-    if not found_path:
-        LOG.warning(f"文件未找到: {filename} (extra={extra_path})")
-        return
+        if not found_path:
+            LOG.warning(f"文件未找到: {filename} (extra={extra_path})")
+            return
 
-    ext = Path(filename).suffix.lower()
-    if ext not in CONVERTIBLE_EXTS:
-        wcf.send_text(f"[文件格式 {ext} 暂不支持，无法保存]", reply_target)
-        return
+        ext = Path(filename).suffix.lower()
+        if ext not in CONVERTIBLE_EXTS:
+            wcf.send_text(f"[文件格式 {ext} 暂不支持，无法保存]", reply_target)
+            return
 
-    LOG.info(f"开始转换文件: {found_path}")
-    md_text, was_converted = convert_to_markdown(found_path)
-    if not md_text:
-        wcf.send_text(f"[文件《{filename}》解析失败，内容为空]", reply_target)
-        return
+        LOG.info(f"开始转换文件: {found_path}")
+        md_text, was_converted = convert_to_markdown(found_path)
+        if not md_text:
+            wcf.send_text(f"[文件《{filename}》解析失败，内容为空]", reply_target)
+            return
 
-    stem = Path(filename).stem
-    save_path = FILE_SAVE_DIR / f"{stem}.md"
-    save_path.write_text(md_text, encoding="utf-8")
-    LOG.info(f"文件已保存: {save_path}，{len(md_text)} 字符")
+        stem = Path(filename).stem
+        save_path = FILE_SAVE_DIR / f"{stem}.md"
+        save_path.write_text(md_text, encoding="utf-8")
+        LOG.info(f"文件已保存: {save_path}，{len(md_text)} 字符")
 
-    if was_converted:
-        wcf.send_text(f"✅ 此文件格式已转换并保存为 {stem}.md\n可用：读取文件 {stem}", reply_target)
-    else:
-        wcf.send_text(f"✅ 此文件格式支持，已保存 {stem}.md\n可用：读取文件 {stem}", reply_target)
+        if was_converted:
+            wcf.send_text(f"✅ 此文件格式已转换并保存为 {stem}.md\n可用：读取文件 {stem}", reply_target)
+        else:
+            wcf.send_text(f"✅ 此文件格式支持，已保存 {stem}.md\n可用：读取文件 {stem}", reply_target)
 
 
 def ask_ai_with_image(session_id: str, image_path: str, user_text: str, context_lines: list = None) -> str:

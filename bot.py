@@ -799,17 +799,33 @@ def _auto_click_login():
 
 
 def _kill_wechat():
-    """强制结束所有 WeChat 相关进程，确保 Wcf() 注入前环境干净"""
-    for proc_name in ["WeChat.exe", "WeChatUtility.exe", "WeChatPlayer.exe", "WeChatBrowser.exe"]:
+    """强制结束所有 WeChat 相关进程 + 释放 wcferry 端口，确保注入前环境干净"""
+    for proc_name in ["WeChat.exe", "WeChatUtility.exe", "WeChatPlayer.exe",
+                       "WeChatBrowser.exe", "WeChatAppEx.exe"]:
         try:
-            subprocess.run(
-                ["taskkill", "/F", "/IM", proc_name, "/T"],
-                capture_output=True, timeout=5
-            )
+            subprocess.run(["taskkill", "/F", "/IM", proc_name, "/T"],
+                           capture_output=True, timeout=5)
         except Exception:
             pass
-    time.sleep(2)
-    LOG.info("[清理] 已结束所有微信相关进程")
+    # 释放 wcferry 占用的端口（10086/10087）
+    for port in [10086, 10087]:
+        try:
+            r = subprocess.run(
+                ["netstat", "-ano", "-p", "TCP"],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in r.stdout.splitlines():
+                if f":{port}" in line and ("LISTENING" in line or "ESTABLISHED" in line):
+                    parts = line.split()
+                    pid = parts[-1]
+                    if pid.isdigit() and int(pid) > 0:
+                        subprocess.run(["taskkill", "/F", "/PID", pid],
+                                       capture_output=True, timeout=5)
+                        LOG.info(f"[清理] 已杀死占用端口 {port} 的进程 PID={pid}")
+        except Exception:
+            pass
+    time.sleep(3)
+    LOG.info("[清理] 已结束所有微信相关进程并释放端口")
 
 
 def _init_wcf():

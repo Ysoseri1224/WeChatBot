@@ -293,9 +293,120 @@ _last_recover_ts_file = MEMORY_DIR / ".last_recover_ts"
 
 
 def _extract_filename_from_xml(xml_str):
-    """从 type=49 消息的 XML 中提取文件名"""
-    m = re.search(r'<title>([^<]+)</title>', xml_str or "")
-    return m.group(1).strip() if m else ""
+    """从 type=49 消息的 XML 中提取文件名（尝试多个标签）"""
+    if not xml_str:
+        return ""
+    s = xml_str if isinstance(xml_str, str) else str(xml_str)
+    # 优先从 <filename> 提取（最准确）
+    m = re.search(r'<filename>([^<]+)</filename>', s)
+    if m:
+        return m.group(1).strip()
+    # 其次 <title>
+    m = re.search(r'<title>([^<]+)</title>', s)
+    if m:
+        name = m.group(1).strip()
+        if '.' in name:  # 确保是文件名而非链接标题
+            return name
+    # 最后 <sourcedisplayname>
+    m = re.search(r'<sourcedisplayname>([^<]+)</sourcedisplayname>', s)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _try_download_from_db(wcf, target_filename):
+    """按需下载：查 DB 找匹配文件名的 type=49 消息，调 download_attach 下载。
+    返回本地文件路径，失败返回 None。"""
+    target_stem = Path(target_filename).stem.lower()
+    target_ext = Path(target_filename).suffix.lower()
+
+    try:
+        dbs = wcf.get_dbs()
+        msg_dbs = [d for d in dbs if d.startswith("MSG")]
+        if not msg_dbs:
+            LOG.warning("[按需下载] 未找到 MSG 数据库")
+            return None
+
+        # 查最近1小时的 type=49 消息
+        min_ts = int(time.time()) - 3600
+        candidates = []
+
+        for db in msg_dbs:
+            try:
+                tables = wcf.get_tables(db)
+                table_names = [t.get("name", "") for t in tables] if isinstance(tables, list) else []
+                for tbl in table_names:
+                    if not tbl.startswith("MSG"):
+                        continue
+                    sql = (
+                        f"SELECT localId, MsgSvrID, StrTalker, StrContent, CreateTime "
+                        f"FROM {tbl} WHERE Type=49 AND CreateTime>{min_ts} "
+                        f"ORDER BY CreateTime DESC LIMIT 50"
+                    )
+                    try:
+                        rows = wcf.query_sql(db, sql)
+                        for row in rows:
+                            raw = row.get("StrContent", "")
+                            if isinstance(raw, bytes):
+                                try:
+                                    raw = raw.decode("utf-8")
+                                except Exception:
+                                    raw = raw.decode("utf-8", errors="replace")
+                            fname = _extract_filename_from_xml(raw)
+                            if not fname:
+                                continue
+                            f_stem = Path(fname).stem.lower()
+                            f_ext = Path(fname).suffix.lower()
+                            # 匹配：完全匹配、前缀匹配、包含匹配
+                            if (f_stem == target_stem or
+                                f_stem.startswith(target_stem) or
+                                target_stem in f_stem):
+                                if not target_ext or f_ext == target_ext:
+                                    candidates.append({
+                                        "msg_id": row.get("MsgSvrID", 0) or row.get("localId", 0),
+                                        "filename": fname,
+                                        "create_time": row.get("CreateTime", 0),
+                                    })
+                    except Exception as e:
+                        LOG.debug(f"[按需下载] 查询 {db}.{tbl} 失败: {e}")
+            except Exception as e:
+                LOG.debug(f"[按需下载] 读取 {db} 表结构失败: {e}")
+
+        if not candidates:
+            LOG.info(f"[按需下载] DB中未找到匹配 {target_filename!r} 的文件消息")
+            return None
+
+        # 取最新的一条
+        candidates.sort(key=lambda x: x["create_time"], reverse=True)
+        best = candidates[0]
+        msg_id = best["msg_id"]
+        filename = best["filename"]
+        LOG.info(f"[按需下载] 找到匹配: {filename} (msg_id={msg_id})，正在下载...")
+
+        ret = wcf.download_attach(msg_id, "", "")
+        LOG.info(f"[按需下载] download_attach 返回: {ret}")
+
+        # 等待文件出现（最多30秒）
+        stem = Path(filename).stem
+        for _ in range(15):
+            time.sleep(2)
+            for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
+                for f in files:
+                    if f == filename or (Path(f).stem.startswith(stem) and Path(f).suffix.lower() == Path(filename).suffix.lower()):
+                        candidate_path = os.path.join(root_dir, f)
+                        try:
+                            if time.time() - os.path.getmtime(candidate_path) < 300:
+                                LOG.info(f"[按需下载] 文件已落盘: {candidate_path}")
+                                return candidate_path
+                        except OSError:
+                            continue
+
+        LOG.warning(f"[按需下载] 30秒内未找到文件: {filename}")
+        return None
+
+    except Exception as e:
+        LOG.error(f"[按需下载] 失败: {e}", exc_info=True)
+        return None
 
 
 def _recover_files_from_db(wcf, group_ids):
@@ -834,8 +945,36 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
             for f, _ in raw_files[:20]:
                 lines.append(f"  📄 {f}")
                 seen_stems.add(Path(f).stem)
+            # 4) DB中最近1小时的文件消息（尚未下载的）
+            try:
+                min_ts = int(time.time()) - 3600
+                msg_dbs = [d for d in wcf.get_dbs() if d.startswith("MSG")]
+                for db in msg_dbs:
+                    tables = wcf.get_tables(db)
+                    tbl_names = [t.get("name", "") for t in tables] if isinstance(tables, list) else []
+                    for tbl in tbl_names:
+                        if not tbl.startswith("MSG"):
+                            continue
+                        try:
+                            rows = wcf.query_sql(db,
+                                f"SELECT StrContent FROM {tbl} WHERE Type=49 AND CreateTime>{min_ts} ORDER BY CreateTime DESC LIMIT 20")
+                            for row in rows:
+                                raw = row.get("StrContent", "")
+                                if isinstance(raw, bytes):
+                                    try:
+                                        raw = raw.decode("utf-8")
+                                    except Exception:
+                                        continue
+                                fname = _extract_filename_from_xml(raw)
+                                if fname and Path(fname).suffix.lower() in CONVERTIBLE_EXTS and Path(fname).stem not in seen_stems:
+                                    lines.append(f"  ⬇️ {fname}")
+                                    seen_stems.add(Path(fname).stem)
+                        except Exception:
+                            pass
+            except Exception as e:
+                LOG.debug(f"[ls文件] DB查询失败: {e}")
             if lines:
-                wcf.send_text(f"📂 文件列表（{len(lines)} 个）：\n" + "\n".join(lines) + "\n\n✅=已转化可读取  📄=缓存中可读取\n用法：读取文件 文件名", reply_to)
+                wcf.send_text(f"📂 文件列表（{len(lines)} 个）：\n" + "\n".join(lines) + "\n\n✅=已转化  📄=本地缓存  ⬇️=可从微信下载\n用法：读取文件 文件名", reply_to)
             else:
                 wcf.send_text("[当前无已检测或已保存的文件]", reply_to)
             return
@@ -879,10 +1018,29 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                     if found_path:
                         break
             if not found_path:
-                wcf.send_text(f"[未找到文件《{filename}》，请确认文件名正确]", reply_to)
-                return
+                # 本地没找到，尝试从微信DB按需下载
+                wcf.send_text(f"⏳ 正在从微信下载《{filename}》...", reply_to)
+                found_path = _try_download_from_db(wcf, filename)
+                if found_path:
+                    # 下载成功，复制并转化保存
+                    tmp_path = FILE_SAVE_DIR / Path(found_path).name
+                    shutil.copy2(found_path, tmp_path)
+                    md_text, _ = convert_to_markdown(str(tmp_path))
+                    if tmp_path.suffix.lower() not in (".md", ".txt"):
+                        tmp_path.unlink(missing_ok=True)
+                    if md_text:
+                        save_path = FILE_SAVE_DIR / f"{Path(found_path).stem}.md"
+                        save_path.write_text(md_text, encoding="utf-8")
+                        found_path = str(save_path)
+                        LOG.info(f"[按需下载] 转化保存: {save_path}")
+                    else:
+                        wcf.send_text(f"❌ 文件《{filename}》下载后解析失败", reply_to)
+                        return
+                else:
+                    wcf.send_text(f"[未找到文件《{filename}》，请确认文件名正确，或文件已过期]", reply_to)
+                    return
             ext = Path(found_path).suffix.lower()
-            if ext not in CONVERTIBLE_EXTS:
+            if ext not in CONVERTIBLE_EXTS and ext != ".md":
                 wcf.send_text(f"[不支持 {ext} 格式]", reply_to)
                 return
             file_text = extract_file_text(found_path)

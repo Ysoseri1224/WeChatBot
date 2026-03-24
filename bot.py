@@ -367,7 +367,15 @@ def _recover_files_from_db(wcf, group_ids):
         _last_recover_ts_file.write_text(str(int(time.time())))
 
         for msg_info in file_msgs:
-            filename = _extract_filename_from_xml(msg_info["content"])
+            raw_content = msg_info["content"]
+            # DB中StrContent可能是bytes，需要解码
+            if isinstance(raw_content, bytes):
+                try:
+                    raw_content = raw_content.decode("utf-8")
+                except Exception:
+                    raw_content = raw_content.decode("utf-8", errors="replace")
+            LOG.info(f"[文件恢复] StrContent前200字: {str(raw_content)[:200]}")
+            filename = _extract_filename_from_xml(raw_content)
             ext = Path(filename).suffix.lower() if filename else ""
             if ext not in CONVERTIBLE_EXTS:
                 LOG.debug(f"[文件恢复] 跳过非可转化文件: {filename!r}")
@@ -601,8 +609,27 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 if not is_at_me:
                     return
 
-            # 文件消息(type=49)：跳过，由文件监控线程处理（wcferry处理type=49会导致微信crash）
+            # 文件消息(type=49)：实时下载+转化（crash前5-10秒窗口足够处理）
             if msg.type == 49:
+                filename = _extract_filename_from_xml(msg.content)
+                ext = Path(filename).suffix.lower() if filename else ""
+                if ext in CONVERTIBLE_EXTS:
+                    LOG.info(f"[文件] 收到可转化文件: {filename} (id={msg.id})")
+                    reply_target = msg.roomid if is_group else msg.sender
+                    # 先触发下载
+                    try:
+                        ret = wcf.download_attach(msg.id, msg.thumb, msg.extra)
+                        LOG.info(f"[文件] download_attach 返回: {ret}")
+                    except Exception as e:
+                        LOG.error(f"[文件] download_attach 失败: {e}")
+                    # 异步处理文件（等待落盘+转化+保存）
+                    Thread(
+                        target=_process_incoming_file,
+                        args=(wcf, filename, msg.extra, reply_target),
+                        daemon=True
+                    ).start()
+                else:
+                    LOG.debug(f"type=49 非可转化文件({filename!r})，跳过")
                 return
 
             if not is_at_me:
@@ -901,10 +928,8 @@ def recv_loop(wcf: Wcf):
         try:
             msg = wcf.get_msg()
             empty_count = 0  # 收到消息，重置计数
-            # type=49(文件/链接)会导致微信5-10秒后crash，跳过
-            # 文件恢复改由重连后查数据库实现（_recover_files_from_db）
-            if msg.type == 49:
-                continue
+            # type=49(文件/链接)会导致微信5-10秒后crash，但5-10秒窗口足够处理单个文件
+            # 多文件场景靠重连后 _recover_files_from_db 补漏
             LOG.debug(f"收到原始消息 type={msg.type} roomid={msg.roomid} sender={msg.sender} content={str(msg.content)[:80]}")
             Thread(target=safe_handle, args=(wcf, msg), daemon=True).start()
         except Empty:

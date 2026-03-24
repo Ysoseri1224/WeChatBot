@@ -732,25 +732,10 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 if not is_at_me:
                     return
 
-            # 文件消息(type=49)：存 pending，提前触发下载（跟图片一样的模式）
+            # type=49(文件/链接)：DLL层会导致微信crash，这里不做处理
+            # 文件靠 _file_watcher 自动检测 + 用户 "读取文件" 指令按需读取
             if msg.type == 49:
-                filename = _extract_filename_from_xml(msg.content)
-                ext = Path(filename).suffix.lower() if filename else ""
-                if filename and ext in CONVERTIBLE_EXTS:
-                    LOG.info(f"[文件] 收到文件: {filename} (id={msg.id})")
-                    group_pending_media[msg.roomid] = {
-                        "type": "file", "filename": filename, "msg": msg
-                    }
-                    buf = group_context_buffer.setdefault(msg.roomid, [])
-                    buf.append(f"{sender_name}: [发送了文件 {filename}]")
-                    # 提前触发下载，@bot 时文件大概率已落盘
-                    try:
-                        wcf.download_attach(msg.id, msg.thumb, msg.extra)
-                        LOG.info(f"[文件] download_attach 已触发")
-                    except Exception as e:
-                        LOG.warning(f"[文件] download_attach 预下载失败: {e}")
-                if not is_at_me:
-                    return
+                return
 
             if not is_at_me:
                 if GROUP_TRIGGER_PREFIX and not content.startswith(GROUP_TRIGGER_PREFIX):
@@ -1132,9 +1117,10 @@ def recv_loop(wcf: Wcf):
         try:
             msg = wcf.get_msg()
             empty_count = 0  # 收到消息，重置计数
-            # type=49(文件/链接)会导致微信5-10秒后crash，但5-10秒窗口足够处理单个文件
-            # 多文件场景靠重连后 _recover_files_from_db 补漏
-            LOG.debug(f"收到原始消息 type={msg.type} roomid={msg.roomid} sender={msg.sender} content={str(msg.content)[:80]}")
+            LOG.debug(f"收到原始消息 type={msg.type} roomid={msg.roomid} sender={msg.sender}")
+            if msg.type == 49:
+                LOG.debug("type=49 跳过（DLL层crash风险）")
+                continue
             Thread(target=safe_handle, args=(wcf, msg), daemon=True).start()
         except Empty:
             empty_count += 1

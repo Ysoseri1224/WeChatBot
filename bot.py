@@ -798,6 +798,20 @@ def _auto_click_login():
     LOG.warning("[自动登录] 60秒内未检测到登录窗口")
 
 
+def _kill_wechat():
+    """强制结束所有 WeChat 相关进程，确保 Wcf() 注入前环境干净"""
+    for proc_name in ["WeChat.exe", "WeChatUtility.exe", "WeChatPlayer.exe", "WeChatBrowser.exe"]:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", proc_name, "/T"],
+                capture_output=True, timeout=5
+            )
+        except Exception:
+            pass
+    time.sleep(2)
+    LOG.info("[清理] 已结束所有微信相关进程")
+
+
 def _init_wcf():
     """初始化 wcferry 连接，解析白名单群，返回 Wcf 实例"""
     global _global_wcf
@@ -832,6 +846,7 @@ def main():
     while True:
         wcf = None
         try:
+            _kill_wechat()  # 确保注入前没有残留进程
             # 后台线程监控登录窗口并自动点击（Wcf()会自己启动微信）
             Thread(target=_auto_click_login, daemon=True).start()
             wcf = _init_wcf()

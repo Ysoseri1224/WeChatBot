@@ -704,16 +704,26 @@ def safe_handle(wcf: Wcf, msg: WxMsg):
 
 def recv_loop(wcf: Wcf):
     LOG.info("消息接收循环已启动")
+    empty_count = 0
+    HEARTBEAT_INTERVAL = 60  # 连续60次Empty（约30秒）后检测一次心跳
     while wcf.is_receiving_msg():
         try:
             msg = wcf.get_msg()
+            empty_count = 0  # 收到消息，重置计数
             # type=49(文件/链接)会导致微信crash，尽早丢弃，不访问任何其他属性
             if msg.type == 49:
                 continue
             LOG.debug(f"收到原始消息 type={msg.type} roomid={msg.roomid} sender={msg.sender} content={str(msg.content)[:80]}")
             Thread(target=safe_handle, args=(wcf, msg), daemon=True).start()
         except Empty:
-            continue
+            empty_count += 1
+            if empty_count >= HEARTBEAT_INTERVAL:
+                empty_count = 0
+                try:
+                    wcf.get_self_wxid()
+                except Exception as e:
+                    LOG.warning(f"心跳检测失败，微信可能已断开: {e}")
+                    return  # 退出recv_loop，触发main()中的重连逻辑
         except Exception as e:
             LOG.error(f"接收消息出错: {e}", exc_info=True)
 

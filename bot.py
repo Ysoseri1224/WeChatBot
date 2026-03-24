@@ -227,16 +227,31 @@ def extract_file_text(filepath: str) -> str:
 
 def _process_incoming_file(wcf: Wcf, filename: str, extra_path: str, reply_target: str):
     """收到文件后异步执行：直接用 extra 路径读取文件，转换为 MD 并保存，回复结果"""
-    # 优先用 extra 直接路径，如果不存在则轮询等待
+    # 规范化路径，去除多余空白和不可见字符
+    extra_path = os.path.normpath(extra_path.strip()) if extra_path else ""
+    extra_dir = str(Path(extra_path).parent) if extra_path else ""
+
+    def _find_file():
+        # 1. 直接用 extra 路径
+        if extra_path and os.path.isfile(extra_path):
+            return extra_path
+        # 2. 在 extra 同目录下按文件名（含前缀匹配）搜索
+        if extra_dir and os.path.isdir(extra_dir):
+            stem = Path(filename).stem
+            ext = Path(filename).suffix.lower()
+            for f in os.listdir(extra_dir):
+                fp = os.path.join(extra_dir, f)
+                if os.path.isfile(fp) and f.lower().endswith(ext) and Path(f).stem.startswith(stem):
+                    LOG.debug(f"兜底找到文件: {fp}")
+                    return fp
+        return None
+
     found_path = None
-    if extra_path and Path(extra_path).exists():
-        found_path = extra_path
-    else:
-        for _ in range(30):
-            if extra_path and Path(extra_path).exists():
-                found_path = extra_path
-                break
-            time.sleep(1)
+    for _ in range(30):
+        found_path = _find_file()
+        if found_path:
+            break
+        time.sleep(1)
 
     if not found_path:
         LOG.warning(f"文件未找到: {filename} (extra={extra_path})")

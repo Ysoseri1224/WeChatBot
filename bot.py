@@ -760,53 +760,42 @@ def recv_loop(wcf: Wcf):
             LOG.error(f"接收消息出错: {e}", exc_info=True)
 
 
-WECHAT_EXE = os.getenv("WECHAT_EXE", r"D:\vx3.9\WeChat\WeChat.exe")
-
-
-def _ensure_wechat_running():
-    """确保微信已启动并登录。如果没运行则启动，如果有登录窗口则自动点击登录按钮。"""
-    # 检查微信是否在运行
-    result = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq WeChat.exe", "/NH"],
-        capture_output=True, text=True, timeout=5
-    )
-    if "WeChat.exe" not in result.stdout:
-        LOG.info("[自动登录] WeChat.exe 未运行，正在启动...")
-        subprocess.Popen([WECHAT_EXE], shell=False)
-        time.sleep(5)  # 等待微信窗口出现
-
-    # 尝试自动点击登录按钮
+def _auto_click_login():
+    """后台线程：持续监控微信登录窗口，出现则自动点击登录按钮。"""
     try:
         from pywinauto import Application
-        app = Application(backend='uia').connect(path='WeChat.exe', timeout=10)
-        dlg = app.window(title='微信')
-        if not dlg.exists(timeout=3):
-            LOG.debug("[自动登录] 未找到微信窗口")
-            return
-        # 微信登录窗口的按钮：尝试多种常见名称
-        for btn_name in ['进入微信', '登录', '登錄', 'Enter WeChat', 'Log In']:
-            try:
-                btn = dlg.child_window(title=btn_name, control_type='Button')
-                if btn.exists(timeout=1):
-                    btn.click_input()
-                    LOG.info(f"[自动登录] 已点击「{btn_name}」按钮，等待微信初始化...")
-                    time.sleep(15)  # 微信登录后需要较长时间加载
-                    return
-            except Exception:
-                continue
-        # 兜底：如果找不到按钮名称，尝试按 Enter
-        try:
-            dlg.set_focus()
-            import pywinauto.keyboard as kb
-            kb.send_keys('{ENTER}')
-            LOG.info("[自动登录] 已发送 Enter 键")
-            time.sleep(3)
-        except Exception as e:
-            LOG.debug(f"[自动登录] 发送 Enter 失败: {e}")
     except ImportError:
-        LOG.warning("[自动登录] pywinauto 未安装，跳过自动登录")
-    except Exception as e:
-        LOG.debug(f"[自动登录] 未能自动登录（可能已登录或窗口不在登录状态）: {e}")
+        LOG.warning("[自动登录] pywinauto 未安装，跳过")
+        return
+    LOG.info("[自动登录] 后台监控已启动，等待登录窗口...")
+    for _ in range(60):  # 最多等60秒
+        try:
+            app = Application(backend='uia').connect(path='WeChat.exe', timeout=2)
+            dlg = app.window(title='微信')
+            if not dlg.exists(timeout=1):
+                time.sleep(1)
+                continue
+            for btn_name in ['进入微信', '登录', '登錄', 'Enter WeChat', 'Log In']:
+                try:
+                    btn = dlg.child_window(title=btn_name, control_type='Button')
+                    if btn.exists(timeout=1):
+                        btn.click_input()
+                        LOG.info(f"[自动登录] 已点击「{btn_name}」按钮")
+                        return
+                except Exception:
+                    continue
+            # 兜底：发 Enter
+            try:
+                dlg.set_focus()
+                import pywinauto.keyboard as kb
+                kb.send_keys('{ENTER}')
+                LOG.info("[自动登录] 已发送 Enter 键")
+                return
+            except Exception:
+                pass
+        except Exception:
+            time.sleep(1)
+    LOG.warning("[自动登录] 60秒内未检测到登录窗口")
 
 
 def _init_wcf():
@@ -843,7 +832,8 @@ def main():
     while True:
         wcf = None
         try:
-            _ensure_wechat_running()
+            # 后台线程监控登录窗口并自动点击（Wcf()会自己启动微信）
+            Thread(target=_auto_click_login, daemon=True).start()
             wcf = _init_wcf()
 
             # 文件监控线程只启动一次（使用 _global_wcf，重连后自动跟随）

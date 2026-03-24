@@ -3,6 +3,7 @@ import re
 import time
 import base64
 import logging
+import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -281,6 +282,67 @@ def _process_incoming_file(wcf: Wcf, filename: str, extra_path: str, reply_targe
             wcf.send_text(f"✅ 此文件格式支持，已保存 {stem}.md\n可用：读取文件 {stem}", reply_target)
 
 
+_watched_files: set = set()  # 已处理过的文件路径集合
+
+
+def _file_watcher(wcf: Wcf):
+    """后台线程：轮询微信缓存目录，检测新文件并自动转换保存"""
+    LOG.info(f"文件监控线程启动，监控目录: {WECHAT_FILE_DIR}")
+    # 初始化：记录启动时已有的文件，避免处理旧文件
+    start_time = time.time()
+    for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
+        for f in files:
+            _watched_files.add(os.path.join(root_dir, f))
+
+    while True:
+        try:
+            time.sleep(3)  # 每3秒扫描一次
+            for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
+                for f in files:
+                    fp = os.path.join(root_dir, f)
+                    if fp in _watched_files:
+                        continue
+                    # 只处理启动后出现的新文件
+                    try:
+                        mtime = os.path.getmtime(fp)
+                    except OSError:
+                        continue
+                    if mtime < start_time:
+                        _watched_files.add(fp)
+                        continue
+                    _watched_files.add(fp)
+                    ext = Path(f).suffix.lower()
+                    if ext not in CONVERTIBLE_EXTS:
+                        continue
+                    LOG.info(f"[文件监控] 检测到新文件: {f}")
+                    try:
+                        # 复制到临时位置再处理，不锁定原始文件
+                        tmp_path = FILE_SAVE_DIR / f
+                        shutil.copy2(fp, tmp_path)
+                        md_text, was_converted = convert_to_markdown(str(tmp_path))
+                        # 删除临时副本（非md的）
+                        if tmp_path.suffix.lower() != ".md":
+                            tmp_path.unlink(missing_ok=True)
+                        if not md_text:
+                            LOG.warning(f"[文件监控] 文件解析为空: {f}")
+                            continue
+                        stem = Path(f).stem
+                        save_path = FILE_SAVE_DIR / f"{stem}.md"
+                        save_path.write_text(md_text, encoding="utf-8")
+                        LOG.info(f"[文件监控] 已保存: {save_path}，{len(md_text)} 字符")
+                        # 通知白名单群
+                        for room_id in group_whitelist_ids:
+                            if was_converted:
+                                wcf.send_text(f"✅ 检测到新文件，已转换并保存为 {stem}.md\n可用：读取文件 {stem}", room_id)
+                            else:
+                                wcf.send_text(f"✅ 检测到新文件，已保存 {stem}.md\n可用：读取文件 {stem}", room_id)
+                    except Exception as e:
+                        LOG.error(f"[文件监控] 处理文件失败 {f}: {e}", exc_info=True)
+        except Exception as e:
+            LOG.error(f"[文件监控] 扫描异常: {e}", exc_info=True)
+            time.sleep(5)
+
+
 def ask_ai_with_image(session_id: str, image_path: str, user_text: str, context_lines: list = None) -> str:
     if AI_PROVIDER not in VISION_PROVIDERS:
         return f"[当前模型 {AI_MODEL} 不支持图片，请切换到 gpt 或 claude]"
@@ -382,30 +444,9 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 if not is_at_me:
                     return
 
-            # 文件消息(type=49)：立即异步处理保存，存 pending 供后续 @bot 使用
+            # 文件消息(type=49)：跳过，由文件监控线程处理（wcferry处理type=49会导致微信crash）
             if msg.type == 49:
-                try:
-                    root = ET.fromstring(content or "")
-                    filename = root.findtext(".//title") or ""
-                except Exception:
-                    filename = ""
-                # extra 字段就是文件完整路径，优先从中提取文件名
-                extra_path = msg.extra or ""
-                if not filename and extra_path:
-                    filename = Path(extra_path).name
-                LOG.debug(f"type=49 filename={filename!r} extra={extra_path[:80]}")
-                buf = group_context_buffer.setdefault(msg.roomid, [])
-                if not filename:
-                    buf.append(f"{sender_name}: [发送了附件（无法识别文件名）]")
-                    if not is_at_me:
-                        return
-                else:
-                    buf.append(f"{sender_name}: [发送了文件 {filename}]")
-                    reply_target = msg.roomid
-                    _process_incoming_file(wcf, filename, extra_path, reply_target)
-                    group_pending_media[msg.roomid] = {"type": "file", "filename": filename, "ts": msg.ts, "path": extra_path}
-                    if not is_at_me:
-                        return
+                return
 
             if not is_at_me:
                 if GROUP_TRIGGER_PREFIX and not content.startswith(GROUP_TRIGGER_PREFIX):
@@ -681,6 +722,7 @@ def main():
         else:
             LOG.info("未设置 GROUP_WHITELIST，将响应所有群的触发词消息")
 
+        Thread(target=_file_watcher, args=(wcf,), daemon=True).start()
         recv_loop(wcf)
 
     except KeyboardInterrupt:

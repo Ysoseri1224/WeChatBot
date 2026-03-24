@@ -924,20 +924,32 @@ def main():
         wcf = None
         try:
             for attempt in range(1, MAX_INJECT_RETRIES + 1):
-                Thread(target=_auto_click_login, daemon=True).start()
-                if attempt > 1:
-                    # 第2次起：彻底清理 → 手动启动微信 → 等登录完成
-                    _kill_wechat()
-                    LOG.info(f"[注入] 手动启动微信: {WECHAT_EXE}")
+                # 检查微信是否在运行
+                r = subprocess.run(
+                    ["tasklist", "/FI", "IMAGENAME eq WeChat.exe", "/NH"],
+                    capture_output=True, text=True, timeout=5
+                )
+                wechat_running = "WeChat.exe" in r.stdout
+
+                if not wechat_running:
+                    if attempt > 1:
+                        _kill_wechat()  # 清理残留
+                    LOG.info(f"[注入] 微信未运行，手动启动: {WECHAT_EXE}")
                     subprocess.Popen([WECHAT_EXE], shell=False)
+                    Thread(target=_auto_click_login, daemon=True).start()
                     LOG.info("[注入] 等待微信启动和登录（30秒）...")
-                    time.sleep(30)  # 等微信完全初始化
+                    time.sleep(30)
+                else:
+                    LOG.info("[注入] 微信已在运行")
+                    Thread(target=_auto_click_login, daemon=True).start()
+
                 try:
                     LOG.info(f"[注入] 第 {attempt}/{MAX_INJECT_RETRIES} 次尝试...")
                     wcf = _init_wcf()
                     break  # 注入成功
                 except _WcfInitError as e:
                     LOG.warning(f"[注入] 第 {attempt} 次失败: {e}")
+                    _kill_wechat()  # 失败后清理，为下一次做准备
                     if attempt >= MAX_INJECT_RETRIES:
                         raise
 

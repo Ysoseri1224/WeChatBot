@@ -732,28 +732,25 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 if not is_at_me:
                     return
 
-            # 文件消息(type=49)：实时下载+转化
+            # 文件消息(type=49)：存 pending，提前触发下载（跟图片一样的模式）
             if msg.type == 49:
-                LOG.info(f"[文件] type=49 到达 handle_msg: id={msg.id} extra={msg.extra!r} thumb={msg.thumb!r} content前100字={str(msg.content)[:100]}")
                 filename = _extract_filename_from_xml(msg.content)
                 ext = Path(filename).suffix.lower() if filename else ""
-                LOG.info(f"[文件] 提取文件名={filename!r} ext={ext!r}")
-                if ext in CONVERTIBLE_EXTS:
-                    reply_target = msg.roomid if is_group else msg.sender
-                    wcf.send_text(f"📥 检测到文件《{filename}》，正在下载...", reply_target)
-                    # 触发下载
+                if filename and ext in CONVERTIBLE_EXTS:
+                    LOG.info(f"[文件] 收到文件: {filename} (id={msg.id})")
+                    group_pending_media[msg.roomid] = {
+                        "type": "file", "filename": filename, "msg": msg
+                    }
+                    buf = group_context_buffer.setdefault(msg.roomid, [])
+                    buf.append(f"{sender_name}: [发送了文件 {filename}]")
+                    # 提前触发下载，@bot 时文件大概率已落盘
                     try:
-                        ret = wcf.download_attach(msg.id, msg.thumb, msg.extra)
-                        LOG.info(f"[文件] download_attach(id={msg.id}) 返回: {ret}")
+                        wcf.download_attach(msg.id, msg.thumb, msg.extra)
+                        LOG.info(f"[文件] download_attach 已触发")
                     except Exception as e:
-                        LOG.error(f"[文件] download_attach 失败: {e}")
-                    # 异步处理文件（等待落盘+转化+保存）
-                    Thread(
-                        target=_process_incoming_file,
-                        args=(wcf, filename, msg.extra, reply_target),
-                        daemon=True
-                    ).start()
-                return
+                        LOG.warning(f"[文件] download_attach 预下载失败: {e}")
+                if not is_at_me:
+                    return
 
             if not is_at_me:
                 if GROUP_TRIGGER_PREFIX and not content.startswith(GROUP_TRIGGER_PREFIX):
@@ -786,29 +783,50 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 wcf.send_text(reply, msg.roomid, msg.sender)
                 return
 
-            # 有待处理文件：去微信缓存目录按文件名搜索
+            # 有待处理文件：download_attach + 读取内容 → 直接发 AI
             if pending and pending["type"] == "file":
+                pm = pending["msg"]
                 filename = pending.get("filename", "")
+                LOG.info(f"[文件] @bot 触发，处理待读文件: {filename}")
+                # 再次触发下载（确保文件落盘）
+                try:
+                    wcf.download_attach(pm.id, pm.thumb, pm.extra)
+                except Exception as e:
+                    LOG.warning(f"[文件] download_attach: {e}")
+                # 等文件出现（最多15秒）
                 found_path = None
-                for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
-                    for f in files:
-                        if f == filename:
-                            found_path = os.path.join(root_dir, f)
+                stem = Path(filename).stem
+                ext_lower = Path(filename).suffix.lower()
+                for _ in range(5):
+                    # 1. extra 路径
+                    if pm.extra and os.path.isfile(pm.extra):
+                        found_path = pm.extra
+                        break
+                    # 2. WECHAT_FILE_DIR 全局搜
+                    for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
+                        for f in files:
+                            if f == filename or (Path(f).stem.startswith(stem) and Path(f).suffix.lower() == ext_lower):
+                                candidate = os.path.join(root_dir, f)
+                                try:
+                                    if time.time() - os.path.getmtime(candidate) < 120:
+                                        found_path = candidate
+                                        break
+                                except OSError:
+                                    continue
+                        if found_path:
                             break
                     if found_path:
                         break
+                    time.sleep(3)
                 if not found_path:
-                    wcf.send_text(f"[未找到文件《{filename}》，请确认文件已下载到本地]", msg.roomid, msg.sender)
+                    wcf.send_text(f"[文件《{filename}》尚未下载完成，请稍后重试]", msg.roomid, msg.sender)
                     return
-                ext = Path(filename).suffix.lower()
-                if ext not in (".docx", ".md", ".pdf", ".txt"):
-                    wcf.send_text(f"[不支持 {ext}，支持 docx/md/pdf/txt]", msg.roomid, msg.sender)
-                    return
+                LOG.info(f"[文件] 找到: {found_path}")
                 file_text = extract_file_text(found_path)
                 if not file_text:
                     wcf.send_text(f"[文件《{filename}》内容为空或解析失败]", msg.roomid, msg.sender)
                     return
-                LOG.info(f"读取文件 {filename}，{len(file_text)} 字符")
+                LOG.info(f"[文件] 读取 {filename}，{len(file_text)} 字符，发给 AI")
                 query = f"以下是文件《{filename}》的内容：\n{file_text[:100000]}\n\n{query or '请总结这个文件'}"
 
         else:

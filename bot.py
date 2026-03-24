@@ -53,6 +53,8 @@ group_whitelist_ids: set = set()
 group_context_buffer: dict = {}   # roomid -> list of "昵称: 内容" 字符串
 group_pending_media: dict = {}    # roomid -> {"type": "image"|"file", "msg": WxMsg, "filename": str}
 _file_process_lock = Lock()       # 防止多文件并发处理导致crash
+_global_wcf = None                # 全局wcf引用，供文件监控线程使用
+_file_watcher_started = False     # 文件监控线程是否已启动
 GROUP_CONTEXT_LIMIT = int(os.getenv("GROUP_CONTEXT_LIMIT", "50"))  # 最多保留条数
 
 VISION_PROVIDERS = {"gpt", "claude"}  # 支持图片的供应商
@@ -285,18 +287,21 @@ def _process_incoming_file(wcf: Wcf, filename: str, extra_path: str, reply_targe
 _watched_files: set = set()  # 已处理过的文件路径集合
 
 
-def _file_watcher(wcf: Wcf):
-    """后台线程：轮询微信缓存目录，检测新文件并自动转换保存"""
-    LOG.info(f"文件监控线程启动，监控目录: {WECHAT_FILE_DIR}")
+def _file_watcher():
+    """后台线程：轮询微信缓存目录，检测新文件并自动转换保存。
+    使用 _global_wcf 发送通知，即使 wcf 重连后也能正常工作。"""
+    global _global_wcf
+    LOG.info(f"[文件监控] 线程启动，监控目录: {WECHAT_FILE_DIR}")
     # 初始化：记录启动时已有的文件，避免处理旧文件
     start_time = time.time()
     for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
         for f in files:
             _watched_files.add(os.path.join(root_dir, f))
+    LOG.info(f"[文件监控] 已索引 {len(_watched_files)} 个现有文件")
 
     while True:
         try:
-            time.sleep(3)  # 每3秒扫描一次
+            time.sleep(5)  # 每5秒扫描一次
             for root_dir, dirs, files in os.walk(WECHAT_FILE_DIR):
                 for f in files:
                     fp = os.path.join(root_dir, f)
@@ -313,7 +318,10 @@ def _file_watcher(wcf: Wcf):
                     _watched_files.add(fp)
                     ext = Path(f).suffix.lower()
                     if ext not in CONVERTIBLE_EXTS:
+                        LOG.debug(f"[文件监控] 跳过不支持的格式: {f}")
                         continue
+                    # 等待文件写入完成（微信可能还在下载）
+                    time.sleep(2)
                     LOG.info(f"[文件监控] 检测到新文件: {f}")
                     try:
                         # 复制到临时位置再处理，不锁定原始文件
@@ -321,7 +329,7 @@ def _file_watcher(wcf: Wcf):
                         shutil.copy2(fp, tmp_path)
                         md_text, was_converted = convert_to_markdown(str(tmp_path))
                         # 删除临时副本（非md的）
-                        if tmp_path.suffix.lower() != ".md":
+                        if tmp_path.suffix.lower() not in (".md", ".txt"):
                             tmp_path.unlink(missing_ok=True)
                         if not md_text:
                             LOG.warning(f"[文件监控] 文件解析为空: {f}")
@@ -330,12 +338,19 @@ def _file_watcher(wcf: Wcf):
                         save_path = FILE_SAVE_DIR / f"{stem}.md"
                         save_path.write_text(md_text, encoding="utf-8")
                         LOG.info(f"[文件监控] 已保存: {save_path}，{len(md_text)} 字符")
-                        # 通知白名单群
-                        for room_id in group_whitelist_ids:
-                            if was_converted:
-                                wcf.send_text(f"✅ 检测到新文件，已转换并保存为 {stem}.md\n可用：读取文件 {stem}", room_id)
-                            else:
-                                wcf.send_text(f"✅ 检测到新文件，已保存 {stem}.md\n可用：读取文件 {stem}", room_id)
+                        # 通知白名单群（仅在 wcf 可用时）
+                        wcf = _global_wcf
+                        if wcf and group_whitelist_ids:
+                            try:
+                                for room_id in group_whitelist_ids:
+                                    if was_converted:
+                                        wcf.send_text(f"✅ 检测到新文件，已转换并保存为 {stem}.md\n可用：读取文件 {stem}", room_id)
+                                    else:
+                                        wcf.send_text(f"✅ 检测到新文件，已保存 {stem}.md\n可用：读取文件 {stem}", room_id)
+                            except Exception as e:
+                                LOG.warning(f"[文件监控] 发送通知失败（wcf可能断开）: {e}")
+                        else:
+                            LOG.info(f"[文件监控] wcf未就绪，跳过通知，文件已保存到 {save_path}")
                     except Exception as e:
                         LOG.error(f"[文件监控] 处理文件失败 {f}: {e}", exc_info=True)
         except Exception as e:
@@ -703,39 +718,70 @@ def recv_loop(wcf: Wcf):
             LOG.error(f"接收消息出错: {e}", exc_info=True)
 
 
+def _init_wcf():
+    """初始化 wcferry 连接，解析白名单群，返回 Wcf 实例"""
+    global _global_wcf
+    wcf = Wcf()
+    wcf.enable_receiving_msg()
+    _global_wcf = wcf
+    LOG.info(f"微信连接成功，当前账号 wxid: {wcf.get_self_wxid()}")
+    info = wcf.get_user_info()
+    LOG.info(f"账号昵称: {info.get('name')}  微信号: {info.get('wxid')}")
+
+    if GROUP_WHITELIST:
+        group_whitelist_ids.clear()
+        contacts = wcf.get_contacts()
+        for c in contacts:
+            if c.get('name') in GROUP_WHITELIST:
+                group_whitelist_ids.add(c.get('wxid'))
+                LOG.info(f"白名单群: {c.get('name')} -> {c.get('wxid')}")
+        if not group_whitelist_ids:
+            LOG.warning(f"未找到白名单群 {GROUP_WHITELIST}，将监听所有群（请确认群名正确）")
+    else:
+        LOG.info("未设置 GROUP_WHITELIST，将响应所有群的触发词消息")
+    return wcf
+
+
 def main():
+    global _global_wcf, _file_watcher_started
     LOG.info(f"正在启动 wcferry，AI 供应商: {AI_PROVIDER} ({AI_MODEL})")
     LOG.info("请确保微信 3.9.x 已登录...")
-    wcf = Wcf()
 
-    try:
-        wcf.enable_receiving_msg()
-        LOG.info(f"微信连接成功，当前账号 wxid: {wcf.get_self_wxid()}")
-        info = wcf.get_user_info()
-        LOG.info(f"账号昵称: {info.get('name')}  微信号: {info.get('wxid')}")
+    RECONNECT_INTERVAL = 10  # 断开后每隔10秒尝试重连
 
-        if GROUP_WHITELIST:
-            contacts = wcf.get_contacts()
-            for c in contacts:
-                if c.get('name') in GROUP_WHITELIST:
-                    group_whitelist_ids.add(c.get('wxid'))
-                    LOG.info(f"白名单群: {c.get('name')} -> {c.get('wxid')}")
-            if not group_whitelist_ids:
-                LOG.warning(f"未找到白名单群 {GROUP_WHITELIST}，将监听所有群（请确认群名正确）")
-        else:
-            LOG.info("未设置 GROUP_WHITELIST，将响应所有群的触发词消息")
-
-        Thread(target=_file_watcher, args=(wcf,), daemon=True).start()
-        recv_loop(wcf)
-
-    except KeyboardInterrupt:
-        LOG.info("正在退出...")
-    finally:
+    while True:
+        wcf = None
         try:
-            wcf.disable_receiving_msg()
-        except AttributeError:
-            pass
-        wcf.cleanup()
+            wcf = _init_wcf()
+
+            # 文件监控线程只启动一次（使用 _global_wcf，重连后自动跟随）
+            if not _file_watcher_started:
+                _file_watcher_started = True
+                Thread(target=_file_watcher, daemon=True).start()
+
+            recv_loop(wcf)
+            # recv_loop 正常退出 = wcferry 断开（微信crash或退出）
+            LOG.warning("⚠️ 消息接收循环退出，微信可能已断开")
+
+        except KeyboardInterrupt:
+            LOG.info("收到 Ctrl+C，正在退出...")
+            break
+        except Exception as e:
+            LOG.error(f"wcferry 连接异常: {e}", exc_info=True)
+        finally:
+            _global_wcf = None
+            if wcf:
+                try:
+                    wcf.disable_receiving_msg()
+                except Exception:
+                    pass
+                try:
+                    wcf.cleanup()
+                except Exception:
+                    pass
+
+        LOG.info(f"⏳ {RECONNECT_INTERVAL} 秒后尝试重新连接微信...")
+        time.sleep(RECONNECT_INTERVAL)
 
 
 if __name__ == "__main__":

@@ -101,6 +101,39 @@ copy .env.example .env
 
 ## CHANGELOG
 
+### v0.4.0 (2026-03-24)
+
+#### 重大变更：文件处理架构重写
+
+**问题背景（type=49 crash 完整调试记录）：**
+
+微信群聊中发送文件（docx/xlsx/pptx 等）时，wcferry 接收到的 type=49 消息会导致微信在 5-10 秒后崩溃（Pipe callback event 2）。这是 wcferry DLL 注入层的问题，Python 层无法阻止。
+
+调试过程：
+1. 最初发现发送 pptx 文件导致 bot 异常退出，怀疑是文件解析逻辑导致
+2. 添加 `threading.Lock` 串行化文件处理 → 仍然 crash
+3. 将异步 Thread 改为同步处理 → 仍然 crash（单文件也 crash）
+4. 将 `_process_incoming_file` 中所有逻辑移除，type=49 收到后直接 return → 仍然 crash
+5. 在 `recv_loop` 中 type=49 消息甚至不读取 `msg.content` 等属性直接 continue → 仍然 crash
+6. 最终确认：crash 发生在 wcferry DLL 内部接收 type=49 消息时，与 Python 代码完全无关
+
+**解决方案：**
+
+- **文件系统监控线程**：不再依赖 type=49 消息拦截，改为后台线程每 5 秒轮询微信缓存目录（`WECHAT_FILE_DIR`），检测新文件并自动转换保存
+- **type=49 静默跳过**：在 `recv_loop` 最早位置丢弃 type=49 消息，减少对微信的影响
+- **自动恢复重连**：`main()` 改为无限循环，wcferry 断开后自动等待 10 秒重连，文件监控线程独立运行不受影响
+- **复制后处理**：文件先复制到 `memory/files/` 再转换，不锁定微信缓存中的原始文件
+
+#### 新增功能
+- `导入文件为记忆 文件名[，记忆名]`：将已保存的文件内容直接导入为长期记忆
+- 文件监控自动检测 + 转换 + 群通知（替代 type=49 消息拦截）
+- wcferry 断开后自动重连（微信 crash 后重启即可恢复）
+
+#### Bug 修复
+- 修复 Python 3.9 下 `Path | None` 类型注解不兼容的问题（改用无返回值注解）
+- 修复 `msg.extra` 路径规范化问题（`os.path.normpath` + `strip()`）
+- 修复多文件并发处理导致的 crash（根本原因为 wcferry DLL 层问题，非并发问题）
+
 ### v0.3.0 (2026-03-24)
 - 收到文件时自动解析并保存为 Markdown，无需 @bot 触发
 - 新增 `docx`/`xlsx`/`pptx` 原生转 Markdown 支持

@@ -249,7 +249,7 @@ def _process_incoming_file(wcf: Wcf, filename: str, extra_path: str, reply_targe
             return None
 
         found_path = None
-        for _ in range(30):
+        for _ in range(5):
             found_path = _find_file()
             if found_path:
                 break
@@ -402,9 +402,7 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 else:
                     buf.append(f"{sender_name}: [发送了文件 {filename}]")
                     reply_target = msg.roomid
-                    Thread(target=_process_incoming_file,
-                           args=(wcf, filename, extra_path, reply_target),
-                           daemon=True).start()
+                    _process_incoming_file(wcf, filename, extra_path, reply_target)
                     group_pending_media[msg.roomid] = {"type": "file", "filename": filename, "ts": msg.ts, "path": extra_path}
                     if not is_at_me:
                         return

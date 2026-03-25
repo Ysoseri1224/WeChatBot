@@ -978,13 +978,19 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 else:
                     # 转化并缓存
                     tmp_path = FILE_SAVE_DIR / Path(chosen_path).name
-                    try:
-                        shutil.copy2(chosen_path, tmp_path)
-                    except Exception as e:
-                        wcf.send_text(f"[文件复制失败: {e}]", reply_to)
-                        return
-                    file_text, _ = convert_to_markdown(str(tmp_path))
-                    if tmp_path.suffix.lower() not in (".md", ".txt"):
+                    convert_src = chosen_path  # 默认从原路径转化
+                    if tmp_path != Path(chosen_path):
+                        try:
+                            if tmp_path.exists():
+                                tmp_path.unlink()
+                            shutil.copy2(chosen_path, tmp_path)
+                            convert_src = str(tmp_path)
+                        except Exception as e:
+                            LOG.warning(f"[读取文件] 复制失败，直接从原路径转化: {e}")
+                            convert_src = chosen_path
+                            tmp_path = None
+                    file_text, _ = convert_to_markdown(convert_src)
+                    if tmp_path and tmp_path.suffix.lower() not in (".md", ".txt"):
                         try:
                             tmp_path.unlink(missing_ok=True)
                         except PermissionError:

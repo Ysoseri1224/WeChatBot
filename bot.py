@@ -1,12 +1,14 @@
 import os
 import re
 import time
+import json
 import base64
 import logging
 import shutil
+import sqlite3
 import subprocess
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from queue import Empty
 from threading import Thread
@@ -62,7 +64,15 @@ MEMORY_DIR = Path(os.getenv("MEMORY_DIR", r"D:\Weixin\bot\memory"))
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 FILE_SAVE_DIR = MEMORY_DIR / "files"
 FILE_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+NOTES_DIR = MEMORY_DIR / "notes"
+NOTES_DIR.mkdir(parents=True, exist_ok=True)
+SCHEDULES_DB = MEMORY_DIR / "schedules.db"
 SOFFICE_PATH = os.getenv("SOFFICE_PATH", r"C:\Program Files\LibreOffice\program\soffice.exe")
+
+BEIJING_TZ = timezone(timedelta(hours=8))
+pending_schedule_confirm: dict = {}  # roomid -> {content, times, ts}
+_schedule_reminder_started = False
+WEEKDAYS_ZH = "一二三四五六日"
 
 
 def memory_load_all() -> str:
@@ -115,6 +125,222 @@ def memory_read(name: str) -> str:
     if path.exists():
         return path.read_text(encoding="utf-8", errors="ignore").strip()
     return ""
+
+
+# ── 工具 ──────────────────────────────────────────────────────────────
+def now_beijing():
+    return datetime.now(BEIJING_TZ)
+
+
+# ── 笔记 ──────────────────────────────────────────────────────────────
+def note_save(name: str, content: str) -> str:
+    safe = re.sub(r'[\\/:*?"<>|]', '_', name.strip())
+    p = NOTES_DIR / f"{safe}.txt"
+    p.write_text(content.strip(), encoding="utf-8")
+    return safe
+
+
+def note_list() -> str:
+    files = sorted(NOTES_DIR.glob("*.txt"))
+    if not files:
+        return "暂无笔记。"
+    lines = ["📝 笔记列表："]
+    for i, f in enumerate(files, 1):
+        mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%m-%d %H:%M")
+        lines.append(f"  {i}. {f.stem}  ({mtime})")
+    return "\n".join(lines)
+
+
+def note_read(name: str):
+    safe = re.sub(r'[\\/:*?"<>|]', '_', name.strip())
+    exact = NOTES_DIR / f"{safe}.txt"
+    if exact.exists():
+        return exact.read_text(encoding="utf-8", errors="replace"), safe
+    candidates = list(NOTES_DIR.glob(f"*{safe}*.txt"))
+    if not candidates:
+        return None, None
+    f = candidates[0]
+    return f.read_text(encoding="utf-8", errors="replace"), f.stem
+
+
+# ── 日程 SQLite ────────────────────────────────────────────────────────
+def _init_schedules_db():
+    conn = sqlite3.connect(str(SCHEDULES_DB))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schedules (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            name     TEXT NOT NULL,
+            content  TEXT,
+            year     INTEGER,
+            month    INTEGER,
+            day      INTEGER,
+            hour     INTEGER,
+            minute   INTEGER,
+            weekday  INTEGER,
+            reminded_morning INTEGER DEFAULT 0,
+            reminded_before  INTEGER DEFAULT 0,
+            roomid   TEXT,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def schedule_add(name, content, year, month, day, hour, minute, weekday, roomid):
+    conn = sqlite3.connect(str(SCHEDULES_DB))
+    conn.execute(
+        "INSERT INTO schedules (name,content,year,month,day,hour,minute,weekday,roomid,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (name, content, year, month, day, hour, minute, weekday, roomid, now_beijing().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def schedule_list() -> str:
+    conn = sqlite3.connect(str(SCHEDULES_DB))
+    rows = conn.execute(
+        "SELECT id,name,year,month,day,hour,minute,weekday FROM schedules "
+        "ORDER BY year,month,day,hour,minute"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return "暂无日程。"
+    lines = ["📅 日程列表："]
+    for row in rows:
+        id_, name, y, mo, d, h, mi, wd = row
+        wd_str = f"周{WEEKDAYS_ZH[wd]}" if wd is not None else ""
+        lines.append(f"  [{id_}] {name}  {y}/{mo:02d}/{d:02d} {h:02d}:{mi:02d} {wd_str}")
+    return "\n".join(lines)
+
+
+def schedule_query(q: str) -> str:
+    conn = sqlite3.connect(str(SCHEDULES_DB))
+    conds, params = [], []
+    wd_map = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+    for ch, wd in wd_map.items():
+        if f"周{ch}" in q or f"星期{ch}" in q:
+            conds.append("weekday=?"); params.append(wd); break
+    nums = re.findall(r'\d+', q)
+    if len(nums) >= 3:
+        y = int(nums[0]); y = y + 2000 if y < 100 else y
+        conds += ["year=?", "month=?", "day=?"]; params += [y, int(nums[1]), int(nums[2])]
+    elif len(nums) == 2:
+        conds += ["month=?", "day=?"]; params += [int(nums[0]), int(nums[1])]
+    elif len(nums) == 1:
+        n = int(nums[0])
+        if n > 2000:
+            conds.append("year=?"); params.append(n)
+        elif n > 12:
+            conds.append("day=?"); params.append(n)
+        else:
+            conds.append("month=?"); params.append(n)
+    if conds:
+        sql = (f"SELECT id,name,year,month,day,hour,minute,weekday,content FROM schedules "
+               f"WHERE ({' AND '.join(conds)}) OR (name LIKE ?) ORDER BY year,month,day,hour,minute")
+        params.append(f"%{q}%")
+    else:
+        sql = ("SELECT id,name,year,month,day,hour,minute,weekday,content FROM schedules "
+               "WHERE name LIKE ? ORDER BY year,month,day,hour,minute")
+        params = [f"%{q}%"]
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    if not rows:
+        return "未找到匹配的日程。"
+    lines = [f"🔍 找到 {len(rows)} 条日程："]
+    for row in rows:
+        id_, name, y, mo, d, h, mi, wd, content = row
+        wd_str = f"周{WEEKDAYS_ZH[wd]}" if wd is not None else ""
+        lines.append(f"  [{id_}] {name}  {y}/{mo:02d}/{d:02d} {h:02d}:{mi:02d} {wd_str}")
+        if content:
+            lines.append(f"       {content[:60]}")
+    return "\n".join(lines)
+
+
+# ── 时间自动检测 ───────────────────────────────────────────────────────
+_TIME_KEYWORD_RE = re.compile(
+    r'(今天|明天|后天|大后天|昨天|本周|这周|下周|上周|'
+    r'周[一二三四五六日天]|星期[一二三四五六日天]|'
+    r'\d{1,2}月\d{1,2}[号日]|\d{1,2}:\d{2}|'
+    r'上午|下午|晚上|早上|下个月|这个月|本月|\d+点(钟|半)?|\d{4}年)'
+)
+
+
+def _has_time_keywords(text: str) -> bool:
+    return bool(_TIME_KEYWORD_RE.search(text))
+
+
+def _extract_times_with_ai(text: str) -> list:
+    now_str = now_beijing().strftime(f"%Y年%m月%d日 %H:%M 周{WEEKDAYS_ZH[now_beijing().weekday()]}")
+    prompt = (
+        f"当前北京时间：{now_str}。\n"
+        '从以下文本中提取所有具体时间点（含模糊表达如"下周一"、"明天下午"等），'
+        '规范化为 YYYY-MM-DD HH:MM（时间不明确用 00:00），给出简短描述。\n'
+        '只返回JSON数组，每项含 datetime 和 desc 字段，无时间点返回 []。\n\n'
+        f"文本：\n{text}"
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=512,
+            temperature=0,
+        )
+        raw = resp.choices[0].message.content.strip()
+        m = re.search(r'\[.*\]', raw, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+    except Exception as e:
+        LOG.warning(f"[时间提取] AI调用失败: {e}")
+    return []
+
+
+# ── 日程提醒线程 ───────────────────────────────────────────────────────
+def _schedule_reminder_loop():
+    global _global_wcf
+    LOG.info("[日程提醒] 后台线程已启动")
+    while True:
+        try:
+            wcf_ref = _global_wcf
+            if wcf_ref and group_whitelist_ids:
+                roomid = list(group_whitelist_ids)[0]
+                now = now_beijing()
+                conn = sqlite3.connect(str(SCHEDULES_DB))
+                # 每天 07:00 提醒当日所有日程
+                if now.hour == 7 and now.minute == 0:
+                    rows = conn.execute(
+                        "SELECT id,name,content,hour,minute,weekday FROM schedules "
+                        "WHERE year=? AND month=? AND day=? AND reminded_morning=0",
+                        (now.year, now.month, now.day)
+                    ).fetchall()
+                    for id_, name, content, h, mi, wd in rows:
+                        wd_str = f"周{WEEKDAYS_ZH[wd]}" if wd is not None else ""
+                        msg = f"📅 今日日程：{name}\n{h:02d}:{mi:02d} {wd_str}"
+                        if content:
+                            msg += f"\n\n{content}"
+                        wcf_ref.send_text(msg, roomid)
+                        conn.execute("UPDATE schedules SET reminded_morning=1 WHERE id=?", (id_,))
+                    conn.commit()
+                # 提前 1 小时提醒
+                ahead = now + timedelta(hours=1)
+                rows = conn.execute(
+                    "SELECT id,name,content,weekday FROM schedules "
+                    "WHERE year=? AND month=? AND day=? AND hour=? AND minute=? AND reminded_before=0",
+                    (ahead.year, ahead.month, ahead.day, ahead.hour, ahead.minute)
+                ).fetchall()
+                for id_, name, content, wd in rows:
+                    wd_str = f"周{WEEKDAYS_ZH[wd]}" if wd is not None else ""
+                    msg = f"⏰ 1小时后：{name} {wd_str}\n{ahead.strftime('%H:%M')}"
+                    if content:
+                        msg += f"\n\n{content}"
+                    wcf_ref.send_text(msg, roomid)
+                    conn.execute("UPDATE schedules SET reminded_before=1 WHERE id=?", (id_,))
+                conn.commit()
+                conn.close()
+        except Exception as e:
+            LOG.warning(f"[日程提醒] 出错: {e}")
+        time.sleep(60)
 
 
 CONVERTIBLE_EXTS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf", ".txt", ".md"}
@@ -648,12 +874,53 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
             session_id = msg.roomid
             sender_name = wcf.get_alias_in_chatroom(msg.sender, msg.roomid) or msg.sender
 
-            # 旁听：普通文字消息存缓冲区
+            # 旁听：普通文字消息存缓冲区，顺便做时间关键词检测
             if msg.type == 1 and not is_at_me:
                 buf = group_context_buffer.setdefault(msg.roomid, [])
                 buf.append(f"{sender_name}: {content}")
                 if len(buf) > GROUP_CONTEXT_LIMIT:
                     buf.pop(0)
+                # 清理超时的待确认日程（5分钟）
+                stale = [r for r, v in pending_schedule_confirm.items() if time.time() - v["ts"] > 300]
+                for r in stale:
+                    pending_schedule_confirm.pop(r, None)
+                # 正则预筛：有时间关键词才调AI
+                if _has_time_keywords(content):
+                    def _async_detect(roomid, text, sname):
+                        times = _extract_times_with_ai(text)
+                        if not times:
+                            return
+                        pending_schedule_confirm[roomid] = {"content": text, "times": times, "ts": time.time(), "sender": sname}
+                        wcf_ref = _global_wcf
+                        if not wcf_ref:
+                            return
+                        if len(times) == 1:
+                            t = times[0]
+                            try:
+                                dt = datetime.strptime(t["datetime"], "%Y-%m-%d %H:%M")
+                                wd_str = f"周{WEEKDAYS_ZH[dt.weekday()]}"
+                                hint = f"{dt.day:02d}/{dt.month:02d}/{str(dt.year)[2:]},{dt.hour:02d}:{dt.minute:02d},{wd_str}"
+                            except Exception:
+                                hint = t["datetime"]
+                            wcf_ref.send_text(
+                                f"🗓 检测到日程：{t['desc']}\n"
+                                f"是否创建？请确认时间或忽略：\n@W. {hint}",
+                                roomid
+                            )
+                        else:
+                            lines = ["🗓 检测到多个时间点，请选择并确认："]
+                            for t in times:
+                                try:
+                                    dt = datetime.strptime(t["datetime"], "%Y-%m-%d %H:%M")
+                                    wd_str = f"周{WEEKDAYS_ZH[dt.weekday()]}"
+                                    hint = f"{dt.day:02d}/{dt.month:02d}/{str(dt.year)[2:]},{dt.hour:02d}:{dt.minute:02d},{wd_str}"
+                                except Exception:
+                                    hint = t["datetime"]
+                                lines.append(f"  · {t['desc']} → @W. {hint}")
+                            wcf_ref = _global_wcf
+                            if wcf_ref:
+                                wcf_ref.send_text("\n".join(lines), roomid)
+                    Thread(target=_async_detect, args=(msg.roomid, content, sender_name), daemon=True).start()
                 return
 
             # 图片消息：存 pending；若未 @bot 则旁听返回，否则继续触发
@@ -735,12 +1002,19 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 "\n"
                 "【文件】\n"
                 "直接发文件即可，自动识别并转化\n"
-                "⚠️ 请逐个发送，发完一个等回复再发下一个\n"
                 "列出文件 / ls文件\n"
-                "总结文件 文件名[，问题]\n"
-                "读取文件 文件名[，问题]\n"
-                "分析文件 文件名[，问题]\n"
-                "翻译文件 文件名[，问题]\n"
+                "总结/读取/分析/翻译文件 文件名[，问题]\n"
+                "\n"
+                "【笔记】\n"
+                "新增笔记 笔记名，内容\n"
+                "列出笔记\n"
+                "查看笔记 笔记名\n"
+                "\n"
+                "【日程】\n"
+                "创建日程 DD/MM/YY HH:MM 名称[，内容]\n"
+                "列出日程\n"
+                "查询日程 名称/日期/周几\n"
+                "（群消息含时间时自动询问是否创建日程）\n"
                 "\n"
                 "【记忆】\n"
                 "列出记忆 / ls\n"
@@ -759,6 +1033,27 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
 
         # === 记忆指令拦截 ===
         q = query.strip()
+
+        # 日程确认：DD/MM/YY，HH:MM，周X
+        m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})[，,](\d{2}):(\d{2})[，,]周([一二三四五六日天])$', q)
+        if m and is_group and msg.roomid in pending_schedule_confirm:
+            pending = pending_schedule_confirm.pop(msg.roomid)
+            dd, mo, yy, hh, mi, wd_ch = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6)
+            year = int(yy) + 2000 if len(yy) <= 2 else int(yy)
+            wd_map = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+            schedule_add(
+                name=pending["times"][0]["desc"] if len(pending["times"]) == 1 else f"{dd}/{mo}/{yy} 日程",
+                content=pending["content"],
+                year=year, month=int(mo), day=int(dd),
+                hour=int(hh), minute=int(mi),
+                weekday=wd_map.get(wd_ch, 0),
+                roomid=msg.roomid
+            )
+            wcf.send_text(
+                f"✅ 日程已创建：{year}/{int(mo):02d}/{int(dd):02d} {hh}:{mi} 周{wd_ch}",
+                msg.roomid, msg.sender
+            )
+            return
 
         # 清除上下文
         if q in ("clear", "清除上下文", "清空上下文", "重置"):
@@ -824,6 +1119,76 @@ def handle_msg(wcf: Wcf, msg: WxMsg):
                 return
             memory_save(mem_name, file_text)
             wcf.send_text(f"✅ 已将《{Path(found_path).name}》保存为记忆「{mem_name}」（{len(file_text)} 字符）", msg.roomid if is_group else msg.sender)
+            return
+
+        # ── 笔记指令 ─────────────────────────────────────────────────────
+        if q in ("列出笔记", "ls笔记"):
+            wcf.send_text(note_list(), msg.roomid if is_group else msg.sender)
+            return
+
+        m = re.match(r'^新增笔记[\s：:]+(.+)$', q, re.DOTALL)
+        if m:
+            raw = m.group(1).strip()
+            parts = re.split(r'[，,]', raw, maxsplit=1)
+            nname = parts[0].strip()
+            ncontent = parts[1].strip() if len(parts) > 1 else ""
+            if not ncontent:
+                wcf.send_text("请提供笔记内容，格式：新增笔记 笔记名，内容", msg.roomid if is_group else msg.sender)
+            else:
+                note_save(nname, ncontent)
+                wcf.send_text(f"📝 笔记「{nname}」已保存。", msg.roomid if is_group else msg.sender)
+            return
+
+        m = re.match(r'^查看笔记[\s：:]+(.+)$', q)
+        if m:
+            text, stem = note_read(m.group(1).strip())
+            if text is None:
+                wcf.send_text(f"未找到笔记「{m.group(1).strip()}」。", msg.roomid if is_group else msg.sender)
+            else:
+                wcf.send_text(f"📝 {stem}：\n{text}", msg.roomid if is_group else msg.sender)
+            return
+
+        # ── 日程指令 ─────────────────────────────────────────────────────
+        if q in ("列出日程", "ls日程"):
+            wcf.send_text(schedule_list(), msg.roomid if is_group else msg.sender)
+            return
+
+        m = re.match(r'^查询日程[\s：:]+(.+)$', q)
+        if m:
+            wcf.send_text(schedule_query(m.group(1).strip()), msg.roomid if is_group else msg.sender)
+            return
+
+        m = re.match(r'^创建日程(.*)$', q)
+        if m:
+            rest = m.group(1).strip()
+            reply_to = msg.roomid if is_group else msg.sender
+            TMPL = (
+                "📅 日程创建格式：\n"
+                "创建日程 DD/MM/YY HH:MM 名称[，内容]\n\n"
+                "示例：\n"
+                "创建日程 30/03/26 14:00 课题汇报，讨论钛合金分子动力学问题"
+            )
+            if not rest:
+                wcf.send_text(TMPL, reply_to)
+                return
+            pm = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})\s+(\d{2}):(\d{2})\s+([^，,]+)[，,]?(.*)$', rest)
+            if not pm:
+                wcf.send_text(f"格式不对，请参考：\n{TMPL}", reply_to)
+                return
+            dd, mo, yy, hh, mi, name, content_part = pm.group(1,2,3,4,5,6,7)
+            year = int(yy) + 2000 if len(yy) <= 2 else int(yy)
+            dt = datetime(year, int(mo), int(dd), int(hh), int(mi))
+            schedule_add(
+                name=name.strip(), content=content_part.strip(),
+                year=year, month=int(mo), day=int(dd),
+                hour=int(hh), minute=int(mi),
+                weekday=dt.weekday(),
+                roomid=msg.roomid if is_group else msg.sender
+            )
+            wcf.send_text(
+                f"✅ 日程已创建：{name.strip()}\n{year}/{int(mo):02d}/{int(dd):02d} {hh}:{mi} 周{WEEKDAYS_ZH[dt.weekday()]}",
+                reply_to
+            )
             return
 
         # 列出文件：列出文件 / ls文件 / 文件列表
@@ -1224,9 +1589,15 @@ def _init_wcf():
 
 
 def main():
-    global _global_wcf, _file_watcher_started
+    global _global_wcf, _file_watcher_started, _schedule_reminder_started
     LOG.info(f"正在启动 wcferry，AI 供应商: {AI_PROVIDER} ({AI_MODEL})")
     LOG.info("请确保微信 3.9.x 已登录...")
+
+    _init_schedules_db()
+    if not _schedule_reminder_started:
+        _schedule_reminder_started = True
+        Thread(target=_schedule_reminder_loop, daemon=True).start()
+        LOG.info("[日程] 提醒线程已启动")
 
     RECONNECT_INTERVAL = 10  # 断开后每隔10秒尝试重连
     WECHAT_EXE = os.getenv("WECHAT_EXE", r"D:\vx3.9\WeChat\WeChat.exe")

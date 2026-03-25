@@ -69,9 +69,11 @@ copy .env.example .env
 
 之后可用 `@bot 总结文件 文件名` 进行提问。
 
+公众号/服务号（`gh_` 前缀）消息会被自动过滤。
+
 ### 日程提醒
 
-日程存于 `memory/schedules.db`（SQLite，已加入 `.gitignore`），提醒时间基于北京时间（UTC+8）：
+日程存于 `memory/schedules.db`（SQLite），提醒时间基于北京时间（UTC+8）：
 
 - 每天 **07:00** 发送当日所有日程到白名单群
 - 日程时间**前 1 小时**再提醒一次
@@ -80,7 +82,7 @@ copy .env.example .env
 
 ### 笔记
 
-笔记以 txt 格式存于 `memory/notes/`（已加入 `.gitignore`），支持模糊名称匹配。
+笔记以 txt 格式存于 `memory/notes/`，支持模糊名称匹配。
 
 ### 支持的文件格式
 
@@ -97,10 +99,10 @@ copy .env.example .env
 
 ### AI 供应商
 在 `.env` 中修改 `AI_PROVIDER` 切换：
-- `gpt` — OpenAI GPT-4o-mini
-- `deepseek` — DeepSeek Chat
-- `claude` — Anthropic Claude Haiku
-- `minimax` — MiniMax M2.5
+- `gpt` — OpenAI
+- `deepseek` — DeepSeek
+- `claude` — Anthropic Claude
+- `minimax` — MiniMax
 
 ## 开机自启
 
@@ -113,9 +115,7 @@ copy .env.example .env
 
 - 需要微信 **3.9.12.51** 版本，其他版本不兼容
 - 必须以**管理员身份**运行
-- `.env` 文件含 API Key，已加入 `.gitignore`，**切勿提交**
 - 处理 `.doc`/`.ppt`/`.xls` 需额外安装 LibreOffice 并配置 `SOFFICE_PATH`
-- 公众号/服务号消息会被自动过滤，防止回复死循环
 
 ---
 
@@ -160,13 +160,6 @@ copy .env.example .env
 3. **Pending 模式**：学图片的处理方式，收到文件先存内存，等 @bot 再处理。但 crash 一来内存里的数据也没了。
 4. **绕开 type=49**：最后想明白了，不拦消息了。`recv_loop` 跳过 type=49，文件交给后台监控线程自动检测，或者用户用 `读取文件` 指令直接从微信缓存目录和数据库里找。
 
-**指令调通的几个坑：**
-
-绕开 type=49 之后，`读取文件` 指令本身又遇到几个问题：
-- **文件名被拆断了**：之前用的正则 `[\s，,。]{1,3}(?=[\u4e00-\u9fff])` 把 `2023英文科技写作` 在空格处切成了 `2023` 和 `英文科技写作`，因为空格后面跟的是中文。改成只认逗号作分隔符。
-- **Windows 文件锁**：docx 转完 Markdown 后想删掉临时副本，结果 Windows 还没放锁，`unlink` 直接抛 `PermissionError`，把整条消息处理链都炸了。套了 `try/except`。
-- **重复匹配**：上面删除失败残留的 `.docx` 副本被当成"已转化"文件列出来，和微信缓存里的同名文件撞了，用户选都没法选。改成 `FILE_SAVE_DIR` 里只认 `.md` 和 `.txt`。
-- **AI 装傻**：内容明明已经传过去了，GPT 看到"文件"俩字就回"我无法读取文件"。改了 prompt，明确告诉它内容是系统提取好的，别说读不了。
 
 #### 新增
 - `读取文件`/`总结文件`/`分析文件`/`翻译文件` 指令：依次搜已转化缓存 → 微信本地缓存 → 数据库下载；多个匹配时列出文件名和时间让用户选
@@ -182,27 +175,16 @@ copy .env.example .env
 - 文件名拆分正则误把空格+中文当分隔符
 - `tmp_path.unlink` 在 Windows 下文件锁未释放时炸掉 `handle_msg`
 - `FILE_SAVE_DIR` 残留 `.docx` 和微信缓存重复匹配
-- AI 收到文件内容后仍说"无法读取文件"
 
 ---
 
 ### v0.4.0 (2026-03-24)
 
-#### 重大变更：文件处理架构重写
+#### 文件处理方式改写
 
-**问题背景（type=49 crash 完整调试记录）：**
+微信发送文件（docx/xlsx/pptx 等）时，wcferry 接收到 type=49 消息会导致微信在几秒后崩溃，根源在 DLL 注入层，Python 层无论如何处理都拦不住。排查后确认与代码逻辑无关，解决方法只能是绕开：不再拦截 type=49 消息，改用文件系统监控线程替代。
 
-微信群聊中发送文件（docx/xlsx/pptx 等）时，wcferry 接收到的 type=49 消息会导致微信在 5-10 秒后崩溃（Pipe callback event 2）。这是 wcferry DLL 注入层的问题，Python 层无法阻止。
-
-调试过程：
-1. 最初发现发送 pptx 文件导致 bot 异常退出，怀疑是文件解析逻辑导致
-2. 添加 `threading.Lock` 串行化文件处理 → 仍然 crash
-3. 将异步 Thread 改为同步处理 → 仍然 crash（单文件也 crash）
-4. 将 `_process_incoming_file` 中所有逻辑移除，type=49 收到后直接 return → 仍然 crash
-5. 在 `recv_loop` 中 type=49 消息甚至不读取 `msg.content` 等属性直接 continue → 仍然 crash
-6. 最终确认：crash 发生在 wcferry DLL 内部接收 type=49 消息时，与 Python 代码完全无关
-
-**解决方案：**
+**方案：**
 
 - **文件系统监控线程**：不再依赖 type=49 消息拦截，改为后台线程每 5 秒轮询微信缓存目录（`WECHAT_FILE_DIR`），检测新文件并自动转换保存
 - **type=49 静默跳过**：在 `recv_loop` 最早位置丢弃 type=49 消息，减少对微信的影响

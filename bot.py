@@ -1599,6 +1599,15 @@ def main():
         Thread(target=_schedule_reminder_loop, daemon=True).start()
         LOG.info("[日程] 提醒线程已启动")
 
+    global _push_server_started, _push_worker_started
+    _ensure_push_queue()
+    if not _push_server_started:
+        _push_server_started = True
+        Thread(target=_push_server, daemon=True).start()
+    if not _push_worker_started:
+        _push_worker_started = True
+        Thread(target=_push_send_worker, daemon=True).start()
+
     RECONNECT_INTERVAL = 10  # 断开后每隔10秒尝试重连
     WECHAT_EXE = os.getenv("WECHAT_EXE", r"D:\vx3.9\WeChat\WeChat.exe")
     MAX_INJECT_RETRIES = 3   # 注入最多尝试次数
@@ -1667,6 +1676,114 @@ def main():
 
         LOG.info(f"⏳ {RECONNECT_INTERVAL} 秒后尝试重新连接微信...")
         time.sleep(RECONNECT_INTERVAL)
+
+
+# ── HTTP 推送服务 ───────────────────────────────────────────────────────
+# Sub Recorder 等外部服务通过 POST /notify 发送推送请求
+# 请求体: {"to": "wxid_xxx 或群id", "msg": "消息内容", "token": "...(optional)"}
+# PUSH_PORT: 监听端口，默认 5700
+# PUSH_TOKEN: 鉴权 token，留空则不鉴权（仅本机访问时可留空）
+
+PUSH_PORT  = int(os.getenv("PUSH_PORT", "5700"))
+PUSH_TOKEN = os.getenv("PUSH_TOKEN", "").strip()
+_push_server_started  = False
+_push_worker_started  = False
+_push_queue: "queue.Queue" = None  # type: ignore  # 延迟初始化避免循环导入
+
+
+def _ensure_push_queue():
+    global _push_queue
+    if _push_queue is None:
+        import queue as _q
+        _push_queue = _q.Queue(maxsize=200)
+    return _push_queue
+
+
+def _push_send_worker():
+    """**单独线程**消费推送队列，微信断开时暂停等待而不丢弃消息"""
+    import queue as _q
+    q = _ensure_push_queue()
+    LOG.info("[Push] 发送 worker 已启动")
+    while True:
+        try:
+            to, msg = q.get(timeout=2)
+        except _q.Empty:
+            continue
+
+        while True:  # 重试直到发送成功
+            wcf = _global_wcf
+            if wcf is not None:
+                try:
+                    wcf.send_text(msg, to)
+                    LOG.info(f"[Push] 已发送到 {to}: {msg[:40]}...")
+                    q.task_done()
+                    break
+                except Exception as e:
+                    LOG.error(f"[Push] send_text 失败: {e}")
+                    time.sleep(3)
+            else:
+                LOG.debug("[Push] 微信未连接，等待 3s 后重试...")
+                time.sleep(3)
+
+
+def _push_server():
+    """HTTP 轻量服务，接收外部推送请求并入队"""
+    import json as _json
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    q = _ensure_push_queue()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):  # 屏蔽默认 access log
+            LOG.debug(f"[Push] {fmt % args}")
+
+        def _send_json(self, code: int, data: dict):
+            payload = _json.dumps(data).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            if self.path == "/health":
+                status = "connected" if _global_wcf else "disconnected"
+                self._send_json(200, {"ok": True, "wechat": status, "queue": q.qsize()})
+            else:
+                self._send_json(404, {"ok": False, "msg": "not found"})
+
+        def do_POST(self):
+            if self.path != "/notify":
+                self._send_json(404, {"ok": False, "msg": "not found"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = _json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                self._send_json(400, {"ok": False, "msg": "invalid json"})
+                return
+
+            if PUSH_TOKEN and body.get("token", "") != PUSH_TOKEN:
+                self._send_json(401, {"ok": False, "msg": "unauthorized"})
+                return
+
+            to  = str(body.get("to",  "")).strip()
+            msg = str(body.get("msg", "")).strip()
+            if not to or not msg:
+                self._send_json(400, {"ok": False, "msg": "missing to or msg"})
+                return
+
+            if q.full():
+                self._send_json(503, {"ok": False, "msg": "queue full"})
+                return
+
+            q.put((to, msg))
+            LOG.info(f"[Push] 收到推送请求 -> {to}，队列长度: {q.qsize()}")
+            self._send_json(200, {"ok": True, "queued": q.qsize()})
+
+    server = HTTPServer(("127.0.0.1", PUSH_PORT), _Handler)
+    LOG.info(f"[Push] HTTP 推送服务已启动: http://127.0.0.1:{PUSH_PORT}/notify")
+    server.serve_forever()
 
 
 if __name__ == "__main__":

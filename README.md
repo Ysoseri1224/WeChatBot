@@ -121,6 +121,22 @@ copy .env.example .env
 
 ## CHANGELOG
 
+### v1.1.1 (2026-04-10)
+
+#### HTTP 推送服务（Sub Recorder 集成）
+
+新增轻量 HTTP 推送接口，使 Sub Recorder 等外部服务可直接向微信发送通知消息，无需额外依赖，仅使用 Python 标准库。
+
+- **`POST /notify`**：接受 JSON `{"to": "wxid/群id", "msg": "消息内容", "token": "..."}` 推送消息到指定接收方
+- **`GET /health`**：返回当前微信连接状态与消息队列长度
+- **消息队列 + 重试 worker**：推送入队后由独立线程发送；微信断开时消息不丢失，自动等待重连后重发（容量 200 条）
+- **`run.bat` 守护循环**：bot 退出后自动等待 5 秒重启
+- **`.env` 配置项**：`PUSH_PORT`（监听端口，默认 5700）、`PUSH_TOKEN`（鉴权 Token，可选）
+
+**Sub Recorder 配置方式：** 通知设置 → 添加「微信 Bot」渠道，推送地址填 `http://127.0.0.1:5700/notify`（Docker 内改用 `host.docker.internal`）。
+
+---
+
 ### v1.1.0 (2026-03-26)
 
 #### 笔记与日程
@@ -141,22 +157,6 @@ copy .env.example .env
 #### 其他
 - `memory/notes/` 目录存笔记，`memory/schedules.db` 存日程
 - 帮助菜单同步更新
-
----
-
-### v1.1.1 (2026-04-10)
-
-#### HTTP 推送服务（Sub Recorder 集成）
-
-新增轻量 HTTP 推送接口，使 Sub Recorder 等外部服务可直接向微信发送通知消息，无需额外依赖，仅使用 Python 标准库。
-
-- **`POST /notify`**：接受 JSON `{"to": "wxid/群id", "msg": "消息内容", "token": "..."}` 推送消息到指定接收方
-- **`GET /health`**：返回当前微信连接状态与消息队列长度
-- **消息队列 + 重试 worker**：推送入队后由独立线程发送；微信断开时消息不丢失，自动等待重连后重发（容量 200 条）
-- **`run.bat` 守护循环**：bot 退出后自动等待 5 秒重启
-- **`.env` 配置项**：`PUSH_PORT`（监听端口，默认 5700）、`PUSH_TOKEN`（鉴权 Token，可选）
-
-**Sub Recorder 配置方式：** 通知设置 → 添加「微信 Bot」渠道，推送地址填 `http://127.0.0.1:5700/notify`（Docker 内改用 `host.docker.internal`）。
 
 ---
 

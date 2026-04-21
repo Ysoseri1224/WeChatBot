@@ -184,18 +184,32 @@ async function convertFile(name,btn){
   btn.disabled=false; btn.textContent='转化为 md';
 }
 
+const CONVERTABLE_EXTS=new Set(['.docx','.doc','.xlsx','.xls','.pptx','.ppt','.pdf','.txt']);
+
 async function loadConvertedFiles(){
   const tb=$('conv-tbody');
   tb.innerHTML='<tr><td colspan="4" style="color:var(--muted)">加载中...</td></tr>';
   const d=await api('/api/files/converted');
   if(d.error){ tb.innerHTML=`<tr><td colspan="4" style="color:var(--red)">${esc(d.error)}</td></tr>`; return; }
   if(!d.length){ tb.innerHTML='<tr><td colspan="4" style="color:var(--muted)">暂无文件</td></tr>'; return; }
-  tb.innerHTML=d.map(f=>`<tr>
-    <td class="font-mono text-xs">${esc(f.name)}</td>
-    <td style="color:var(--muted)">${fmtBytes(f.size)}</td>
-    <td style="color:var(--muted)">${fmtTime(f.mtime)}</td>
-    <td class="td-actions"><button class="btn btn-danger btn-sm" onclick="delConverted('${esc(f.name)}')">删除</button></td>
-  </tr>`).join('');
+  tb.innerHTML=d.map(f=>{
+    const ext=f.name.substring(f.name.lastIndexOf('.')).toLowerCase();
+    const canConvert=CONVERTABLE_EXTS.has(ext);
+    return `<tr>
+      <td class="font-mono text-xs">${esc(f.name)}</td>
+      <td style="color:var(--muted)">${fmtBytes(f.size)}</td>
+      <td style="color:var(--muted)">${fmtTime(f.mtime)}</td>
+      <td class="td-actions">${canConvert?`<button class="btn btn-ghost btn-sm" onclick="convertConverted('${esc(f.name)}',this)">转化为 md</button>`:''}<button class="btn btn-danger btn-sm" onclick="delConverted('${esc(f.name)}')">删除</button></td>
+    </tr>`;
+  }).join('');
+}
+
+async function convertConverted(name,btn){
+  btn.disabled=true; btn.textContent='转化中...';
+  const d=await api('/api/files/convert',{method:'POST',body:JSON.stringify({filename:name,from_converted:true})});
+  toast(d.ok?d.msg:(d.msg||d.error||'失败'),d.ok);
+  btn.disabled=false; btn.textContent='转化为 md';
+  if(d.ok) loadConvertedFiles();
 }
 
 async function delConverted(name){
@@ -217,6 +231,20 @@ function switchDataTab(tab,el){
 // ── Schedules ──────────────────────────────────────────────────────────
 let _editingSchId=null;
 
+async function openSchModal(id){
+  _editingSchId=id||null;
+  $('sch-modal-title').textContent=id?'编辑日程':'新建日程';
+  $('sf-name').value=''; $('sf-date').value=''; $('sf-time').value='';
+  $('sf-weekday').value=''; $('sf-content').value='';
+  $('sch-modal').classList.remove('hidden');
+  if(id) await loadSchForEdit(id);
+  setTimeout(()=>$('sf-name').focus(),50);
+}
+function closeSchModal(){ $('sch-modal').classList.add('hidden'); _editingSchId=null; }
+
+function openSchForm(id){ openSchModal(id); }
+function closeSchForm(){ closeSchModal(); }
+
 async function loadSchedules(){
   const tb=$('sch-tbody');
   tb.innerHTML='<tr><td colspan="6" style="color:var(--muted)">加载中...</td></tr>';
@@ -236,32 +264,18 @@ async function loadSchedules(){
   </tr>`).join('');
 }
 
-async function openSchForm(id){
-  _editingSchId=id;
-  $('sch-form-title').textContent=id?'编辑日程':'新建日程';
-  if(id){
-    const all=await api('/api/schedules');
-    const s=(all||[]).find(x=>x.id===id);
-    if(s){
-      $('sf-name').value=s.name||'';
-      $('sf-content').value=s.content||'';
-      // parse datetime "YYYY/MM/DD HH:MM"
-      const [datePart,timePart]=(s.datetime||'').split(' ');
-      if(datePart){ $('sf-date').value=datePart.replace(/\//g,'-'); }
-      if(timePart){ $('sf-time').value=timePart; }
-      // weekday
-      const wdMap={'周一':'0','周二':'1','周三':'2','周四':'3','周五':'4','周六':'5','周日':'6'};
-      $('sf-weekday').value=wdMap[s.weekday]||'';
-    }
-  } else {
-    $('sf-name').value=''; $('sf-date').value=''; $('sf-time').value='';
-    $('sf-weekday').value=''; $('sf-content').value='';
-  }
-  $('sch-form').classList.remove('hidden');
-  $('sch-form').scrollIntoView({behavior:'smooth'});
+async function loadSchForEdit(id){
+  const all=await api('/api/schedules');
+  const s=(all||[]).find(x=>x.id===id);
+  if(!s) return;
+  $('sf-name').value=s.name||'';
+  $('sf-content').value=s.content||'';
+  const [datePart,timePart]=(s.datetime||'').split(' ');
+  if(datePart) $('sf-date').value=datePart.replace(/\//g,'-');
+  if(timePart) $('sf-time').value=timePart;
+  const wdMap={'周一':'0','周二':'1','周三':'2','周四':'3','周五':'4','周六':'5','周日':'6'};
+  $('sf-weekday').value=wdMap[s.weekday]||'';
 }
-
-function closeSchForm(){ $('sch-form').classList.add('hidden'); _editingSchId=null; }
 
 async function submitSchForm(){
   const name=$('sf-name').value.trim();

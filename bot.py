@@ -2040,9 +2040,14 @@ def _push_server():
     def api_files_raw():
         exts = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf", ".txt", ".md"}
         try:
-            files = [p for p in Path(WECHAT_FILE_DIR).iterdir() if p.suffix.lower() in exts]
+            files = []
+            for root, _, fnames in os.walk(WECHAT_FILE_DIR):
+                for fn in fnames:
+                    if Path(fn).suffix.lower() in exts:
+                        p = Path(root) / fn
+                        files.append(p)
             files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            return jsonify([{"name": p.name, "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)} for p in files])
+            return jsonify([{"name": p.name, "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)} for p in files[:200]])
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
@@ -2058,10 +2063,19 @@ def _push_server():
     def api_files_convert():
         body = request.get_json(silent=True) or {}
         filename = str(body.get("filename", "")).strip()
+        from_converted = bool(body.get("from_converted", False))
         if not filename:
             return jsonify({"ok": False, "msg": "missing filename"}), 400
-        src = Path(WECHAT_FILE_DIR) / filename
-        if not src.exists():
+        if from_converted:
+            src = FILE_SAVE_DIR / filename
+        else:
+            # 递归搜索 WECHAT_FILE_DIR
+            src = None
+            for root, _, fnames in os.walk(WECHAT_FILE_DIR):
+                if filename in fnames:
+                    src = Path(root) / filename
+                    break
+        if src is None or not src.exists():
             return jsonify({"ok": False, "msg": "file not found"}), 404
         def _do_convert():
             try:

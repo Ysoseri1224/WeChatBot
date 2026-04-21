@@ -217,32 +217,6 @@
             <tbody id="sch-tbody"></tbody>
           </table></div>
         </div>
-        <!-- Schedule form panel -->
-        <div id="sch-form" class="card max-w-lg hidden">
-          <div class="card-title" id="sch-form-title">新建日程</div>
-          <div class="space-y-3">
-            <div class="field"><label class="field-label">名称 *</label><input type="text" id="sf-name" class="input" placeholder="日程名称"></div>
-            <div class="grid grid-cols-2 gap-3">
-              <div class="field"><label class="field-label">日期</label><input type="date" id="sf-date" class="input"></div>
-              <div class="field"><label class="field-label">时间</label><input type="time" id="sf-time" class="input"></div>
-            </div>
-            <div class="field">
-              <label class="field-label">每周循环</label>
-              <select id="sf-weekday" class="input">
-                <option value="">不循环（单次）</option>
-                <option value="0">每周一</option><option value="1">每周二</option>
-                <option value="2">每周三</option><option value="3">每周四</option>
-                <option value="4">每周五</option><option value="5">每周六</option>
-                <option value="6">每周日</option>
-              </select>
-            </div>
-            <div class="field"><label class="field-label">备注内容</label><textarea id="sf-content" class="input" rows="3" placeholder="日程备注（可选）"></textarea></div>
-          </div>
-          <div class="flex gap-2 mt-4">
-            <button class="btn btn-primary btn-sm" onclick="submitSchForm()">保存</button>
-            <button class="btn btn-ghost btn-sm" onclick="closeSchForm()">取消</button>
-          </div>
-        </div>
       </div>
 
       <!-- Notes -->
@@ -347,6 +321,35 @@
   </div>
 
 </main>
+
+<!-- Schedule modal -->
+<div id="sch-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeSchModal()">
+  <div class="modal-box" style="max-width:480px">
+    <div class="modal-title" id="sch-modal-title">新建日程</div>
+    <div class="space-y-3 mt-3">
+      <div class="field"><label class="field-label">名称 *</label><input type="text" id="sf-name" class="input" placeholder="日程名称"></div>
+      <div class="grid grid-cols-2 gap-3">
+        <div class="field"><label class="field-label">日期</label><input type="date" id="sf-date" class="input"></div>
+        <div class="field"><label class="field-label">时间</label><input type="time" id="sf-time" class="input"></div>
+      </div>
+      <div class="field">
+        <label class="field-label">每周循环</label>
+        <select id="sf-weekday" class="input">
+          <option value="">不循环（单次）</option>
+          <option value="0">每周一</option><option value="1">每周二</option>
+          <option value="2">每周三</option><option value="3">每周四</option>
+          <option value="4">每周五</option><option value="5">每周六</option>
+          <option value="6">每周日</option>
+        </select>
+      </div>
+      <div class="field"><label class="field-label">备注内容</label><textarea id="sf-content" class="input" rows="3" placeholder="日程备注（可选）"></textarea></div>
+    </div>
+    <div class="flex justify-end gap-2 mt-4">
+      <button class="btn btn-ghost btn-sm" onclick="closeSchModal()">取消</button>
+      <button class="btn btn-primary btn-sm" onclick="submitSchForm()">保存</button>
+    </div>
+  </div>
+</div>
 
 <!-- Key edit modal -->
 <div id="key-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeKeyModal()">

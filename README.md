@@ -150,6 +150,14 @@ bot 启动后访问 `http://127.0.0.1:5700` 即可打开管理控制台：
 
 ---
 
+### v2.0.1 (2026-04-21)
+
+#### WebUI 重设计 + Bug 修复
+
+前端用 Tailwind CSS CDN 完全重写，采用浅绿色（emerald）配色方案，浅色模式为默认，支持深色切换，localStorage 持久化。修复 6 个 bug：① 路由冲突（`/<path:filename>` 通配符拦截 `/api/*` 请求，导致模型接口/Memory/网络配置等页面 JSON 解析错误）；② 实时日志改用 SSE（Server-Sent Events）替代 WebSocket，彻底解决跨线程 `ws.send()` 不安全导致日志空白的问题；③ `/api/account` 头像/wxid 字段名适配多种 wcferry 返回格式；④ 新增 `POST /api/schedules` 创建日程，前端日程模块增加「新建日程」按钮和含日期时间 picker 的完整表单；⑤ 外观配置新增 17 个 CSS 变量配色项；⑥ 日程编辑支持完整时间字段修改。
+
+---
+
 ### v2.0.0 (2026-04-21)
 
 #### Web 管理界面全面升级

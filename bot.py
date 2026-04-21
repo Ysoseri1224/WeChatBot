@@ -1773,7 +1773,8 @@ _push_server_started  = False
 _push_worker_started  = False
 _push_queue = None  # 延迟初始化
 _bot_start_time = time.time()
-_ws_log_clients: list = []  # 已连接的 WebSocket 日志订阅者
+_ws_log_clients: list = []  # 保留兼容（已废弃）
+_sse_log_clients: list = []  # SSE 日志订阅者（每个元素是 queue.Queue）
 
 
 def _ensure_push_queue():
@@ -1808,11 +1809,11 @@ def _push_send_worker():
                 time.sleep(3)
 
 
-# ── WebSocket 日志广播 Handler ───────────────────────────────────────────
-class _WsLogHandler(logging.Handler):
-    """把日志推送到所有已连接的 WebSocket 客户端"""
+# ── SSE 日志广播 Handler ─────────────────────────────────────────
+class _SseLogHandler(logging.Handler):
+    """把日志推送到所有 SSE 客户端的队列（线程安全）"""
     def emit(self, record):
-        if not _ws_log_clients:
+        if not _sse_log_clients:
             return
         try:
             entry = json.dumps({
@@ -1823,42 +1824,46 @@ class _WsLogHandler(logging.Handler):
         except Exception:
             return
         dead = []
-        for ws in list(_ws_log_clients):
+        for q in list(_sse_log_clients):
             try:
-                ws.send(entry)
+                q.put_nowait(entry)
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            _ws_log_clients.discard(ws) if hasattr(_ws_log_clients, "discard") else None
+                dead.append(q)
+        for q in dead:
             try:
-                _ws_log_clients.remove(ws)
+                _sse_log_clients.remove(q)
             except ValueError:
                 pass
 
 
+class _WsLogHandler(logging.Handler):  # 保留兼容，已不使用
+    def emit(self, record):
+        pass
+
+
 def _push_server():
     """Flask Web 管理界面 + HTTP 推送服务"""
-    from flask import Flask, request, jsonify, send_from_directory
-    from flask_sock import Sock
+    from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 
     q = _ensure_push_queue()
     app = Flask(__name__, static_folder=None)
-    sock = Sock(app)
 
     import logging as _logging
-    _ws_handler = _WsLogHandler()
-    _ws_handler.setFormatter(logging.Formatter("%(message)s"))
-    _logging.getLogger().addHandler(_ws_handler)
+    _sse_handler = _SseLogHandler()
+    _sse_handler.setFormatter(logging.Formatter("%(message)s"))
+    _logging.getLogger().addHandler(_sse_handler)
 
     webui_dir = Path(__file__).parent / "webui"
 
-    # ── 静态文件 ────────────────────────────────────────────────────────
+    # ── 静态文件（不拦截 api/ 路径）───────────────────────────────────────
     @app.route("/")
     def index():
         return send_from_directory(str(webui_dir), "index.html")
 
     @app.route("/<path:filename>")
     def static_files(filename):
+        if filename.startswith(("api/", "ws/")):
+            return jsonify({"error": "not found"}), 404
         return send_from_directory(str(webui_dir), filename)
 
     # ── 兼容旧接口 ──────────────────────────────────────────────────────
@@ -1972,20 +1977,31 @@ def _push_server():
         matches[0].unlink()
         return jsonify({"ok": True})
 
-    # ── WebSocket 日志流 ────────────────────────────────────────────────
-    @sock.route("/ws/logs")
-    def ws_logs(ws):
-        _ws_log_clients.append(ws)
-        try:
-            while True:
-                ws.receive(timeout=30)
-        except Exception:
-            pass
-        finally:
+    # ── SSE 日志流（替代 WebSocket，线程安全）──────────────────────────
+    @app.route("/api/logs/stream")
+    def api_logs_stream():
+        client_q = queue.Queue(maxsize=500)
+        _sse_log_clients.append(client_q)
+
+        def generate():
             try:
-                _ws_log_clients.remove(ws)
-            except ValueError:
-                pass
+                while True:
+                    try:
+                        msg = client_q.get(timeout=25)
+                        yield f"data: {msg}\n\n"
+                    except queue.Empty:
+                        yield ": keepalive\n\n"
+            finally:
+                try:
+                    _sse_log_clients.remove(client_q)
+                except ValueError:
+                    pass
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     # ── 账号信息 ────────────────────────────────────────────────────────
     @app.route("/api/account")
@@ -1995,10 +2011,16 @@ def _push_server():
             return jsonify({"wxid": "", "name": "", "avatar": ""})
         try:
             info = wcf.get_user_info()
-            wxid = info.get("wxid", "") if isinstance(info, dict) else ""
-            name = info.get("name", "") if isinstance(info, dict) else ""
-            avatar_url = info.get("small_head_img_url", "") if isinstance(info, dict) else ""
-        except Exception:
+            if not isinstance(info, dict):
+                info = {}
+            wxid = info.get("wxid") or info.get("Wxid") or ""
+            name = info.get("name") or info.get("Name") or info.get("nickName") or ""
+            # 尝试多个可能的头像字段名
+            avatar_url = (info.get("small_head_img_url") or info.get("headImgUrl")
+                          or info.get("avatar") or info.get("head_img") or "")
+            LOG.debug(f"[account] get_user_info keys: {list(info.keys())}")
+        except Exception as e:
+            LOG.warning(f"[account] get_user_info 失败: {e}")
             wxid, name, avatar_url = "", "", ""
         return jsonify({"wxid": wxid, "name": name, "avatar": avatar_url})
 
@@ -2058,6 +2080,34 @@ def _push_server():
         return jsonify({"ok": True})
 
     # ── 日程编辑 ────────────────────────────────────────────────────────
+    @app.route("/api/schedules", methods=["POST"])
+    def api_create_schedule():
+        body = request.get_json(silent=True) or {}
+        name    = str(body.get("name", "")).strip()
+        content = str(body.get("content", "")).strip()
+        year    = int(body.get("year",  0))
+        month   = int(body.get("month", 0))
+        day     = int(body.get("day",   0))
+        hour    = int(body.get("hour",  0))
+        minute  = int(body.get("minute",0))
+        weekday = body.get("weekday")  # None or 0-6
+        if weekday is not None:
+            weekday = int(weekday)
+        if not name:
+            return jsonify({"ok": False, "msg": "name is required"}), 400
+        try:
+            conn = sqlite3.connect(str(SCHEDULES_DB))
+            conn.execute(
+                "INSERT INTO schedules (name,year,month,day,hour,minute,weekday,content) VALUES (?,?,?,?,?,?,?,?)",
+                (name, year, month, day, hour, minute, weekday, content)
+            )
+            conn.commit()
+            new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.close()
+            return jsonify({"ok": True, "id": new_id})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     @app.route("/api/schedules/<int:sid>", methods=["PUT"])
     def api_update_schedule(sid):
         body = request.get_json(silent=True) or {}

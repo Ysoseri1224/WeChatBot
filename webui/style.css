@@ -1,6 +1,9 @@
 /* ── CSS Variables: light (default) ── */
 :root {
   --bg:         #f0fdf4;
+  --bg-gradient-a:#f0fdf4;
+  --bg-gradient-b:#dcfce7;
+  --bg-gradient-c:#ecfeff;
   --surface:    #ffffff;
   --surface2:   #f0fdf4;
   --surface3:   #dcfce7;
@@ -22,6 +25,9 @@
 /* ── Dark theme ── */
 [data-theme="dark"] {
   --bg:         #0a0f0d;
+  --bg-gradient-a:#0a0f0d;
+  --bg-gradient-b:#0f1c14;
+  --bg-gradient-c:#10211b;
   --surface:    #111814;
   --surface2:   #162018;
   --surface3:   #1c2b20;
@@ -42,7 +48,13 @@
 
 /* ── Base ── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-body { background: var(--bg); color: var(--text); font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+body {
+  background:
+    radial-gradient(circle at top left, color-mix(in srgb, var(--bg-gradient-b) 60%, transparent) 0%, transparent 34%),
+    radial-gradient(circle at top right, color-mix(in srgb, var(--bg-gradient-c) 55%, transparent) 0%, transparent 30%),
+    linear-gradient(135deg, var(--bg-gradient-a) 0%, var(--bg) 48%, var(--bg-gradient-b) 100%);
+  color: var(--text); font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
 
 /* Tailwind utility extensions using CSS vars */
 .bg-bg       { background: var(--bg); }
@@ -91,11 +103,30 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, "P
 .card {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 12px; padding: 18px 20px;
+  box-shadow: 0 10px 30px rgba(16,185,129,.05);
 }
 .card-title {
   font-size: 11px; font-weight: 700; color: var(--muted);
   text-transform: uppercase; letter-spacing: .6px; margin-bottom: 14px;
   display: flex; align-items: center; justify-content: space-between;
+}
+
+.account-hero {
+  display: flex; align-items: center; gap: 16px;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 12%, var(--surface)) 0%, var(--surface) 58%, color-mix(in srgb, var(--accent) 7%, var(--surface)) 100%);
+}
+.account-avatar {
+  width: 72px; height: 72px; border-radius: 9999px;
+  display: flex; align-items: center; justify-content: center;
+  overflow: hidden; flex-shrink: 0; font-size: 24px; font-weight: 700; color: #fff;
+  background: linear-gradient(135deg, var(--accent), var(--accent-h));
+  box-shadow: 0 10px 24px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.account-title { font-size: 22px; font-weight: 800; }
+.account-subtitle { font-size: 13px; color: var(--muted); margin-top: 4px; }
+.account-badge {
+  padding: 6px 10px; border-radius: 9999px; flex-shrink: 0;
+  background: var(--accent-bg); color: var(--accent-text); font-size: 12px; font-weight: 700;
 }
 
 /* ── Stat grid ── */
@@ -151,7 +182,7 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, "P
 
 /* ── Log ── */
 #log-box {
-  height: calc(100vh - 140px);
+  height: 360px;
   overflow-y: auto; background: var(--surface);
   border: 1px solid var(--border); border-radius: 10px;
   padding: 12px 14px;
@@ -176,6 +207,10 @@ td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align:
 tr:last-child td { border-bottom: none; }
 tr:hover td { background: var(--surface2); }
 .td-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.row-highlight td {
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface)) !important;
+  box-shadow: inset 3px 0 0 var(--accent);
+}
 .badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; }
 .badge-green { background: color-mix(in srgb, var(--green) 15%, transparent); color: var(--green); }
 .badge-gray { background: var(--surface2); color: var(--muted); }
@@ -223,6 +258,21 @@ select.input { cursor: pointer; }
 .theme-preview { height: 76px; }
 .theme-label { padding: 8px 10px; font-size: 12px; font-weight: 600; text-align: center; background: var(--surface); }
 
+.green-palette-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(28px, 1fr));
+  gap: 10px;
+}
+.green-chip {
+  width: 28px; height: 28px; border-radius: 8px; border: 2px solid transparent;
+  cursor: pointer; transition: transform .15s, box-shadow .15s, border-color .15s;
+}
+.green-chip:hover { transform: translateY(-1px) scale(1.05); }
+.green-chip.active {
+  border-color: var(--text);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
 /* ── Color grid ── */
 .color-item { display: flex; align-items: center; gap: 8px; cursor: pointer; padding: 6px 8px; border-radius: 8px; transition: background .15s; }
 .color-item:hover { background: var(--surface2); }
@@ -245,6 +295,19 @@ select.input { cursor: pointer; }
   box-shadow: 0 20px 60px rgba(0,0,0,.15);
 }
 .modal-title { font-size: 15px; font-weight: 700; }
+
+.action-notice {
+  position: fixed; top: 18px; left: 50%; transform: translate(-50%, -12px);
+  background: var(--surface); border: 1px solid var(--border); color: var(--text);
+  border-radius: 14px; padding: 13px 18px; z-index: 220; min-width: 320px; max-width: 560px;
+  text-align: center; font-size: 14px; font-weight: 600; pointer-events: none;
+  box-shadow: 0 18px 40px rgba(0,0,0,.16); opacity: 0;
+  transition: opacity .22s, transform .22s;
+}
+.action-notice.show { opacity: 1; transform: translate(-50%, 0); }
+.action-notice.info { border-color: color-mix(in srgb, var(--blue) 35%, var(--border)); color: var(--blue); }
+.action-notice.ok { border-color: color-mix(in srgb, var(--green) 40%, var(--border)); color: var(--green); }
+.action-notice.err { border-color: color-mix(in srgb, var(--red) 40%, var(--border)); color: var(--red); }
 
 /* ── Toast ── */
 .toast {

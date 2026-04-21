@@ -772,11 +772,15 @@ def _convert_and_save(src: Path) -> Path:
     stem = src.stem
     _file_convert_status[stem] = {"status": "converting", "path": str(src), "md_path": "", "name": src.name}
     tmp_path = FILE_SAVE_DIR / src.name
-    shutil.copy2(str(src), tmp_path)
-    md_text, _ = convert_to_markdown(str(tmp_path))
-    if tmp_path.suffix.lower() not in (".md", ".txt"):
+    work_path = tmp_path
+    if src.resolve() != tmp_path.resolve():
+        shutil.copy2(str(src), tmp_path)
+    else:
+        work_path = src
+    md_text, _ = convert_to_markdown(str(work_path))
+    if work_path.suffix.lower() not in (".md", ".txt") and work_path.exists() and work_path.resolve() != src.resolve():
         try:
-            tmp_path.unlink()
+            work_path.unlink()
         except Exception:
             pass
     if not md_text:
@@ -1860,6 +1864,10 @@ def _push_server():
     def index():
         return send_from_directory(str(webui_dir), "index.html")
 
+    @app.route("/favicon.ico")
+    def favicon():
+        return Response(status=204)
+
     @app.route("/<path:filename>")
     def static_files(filename):
         if filename.startswith(("api/", "ws/")):
@@ -2058,6 +2066,13 @@ def _push_server():
             return jsonify([{"name": p.name, "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)} for p in files if p.is_file()])
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/files/status/<stem>")
+    def api_files_status(stem):
+        info = _file_convert_status.get(stem)
+        if not info:
+            return jsonify({"status": "missing"}), 404
+        return jsonify(info)
 
     @app.route("/api/files/convert", methods=["POST"])
     def api_files_convert():

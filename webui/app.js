@@ -12,6 +12,25 @@ function toast(msg, ok=true){
   _toastTimer=setTimeout(()=>{ el.className='toast hidden'; },3000);
 }
 
+let _noticeTimer;
+function showActionNotice(msg, type='info', sticky=false){
+  const el=$('action-notice');
+  if(!el) return;
+  el.textContent=msg;
+  el.className='action-notice show '+type;
+  clearTimeout(_noticeTimer);
+  if(!sticky){
+    _noticeTimer=setTimeout(()=>{ el.className='action-notice hidden'; }, 3200);
+  }
+}
+
+function hideActionNotice(){
+  const el=$('action-notice');
+  if(!el) return;
+  clearTimeout(_noticeTimer);
+  el.className='action-notice hidden';
+}
+
 async function api(path,opts={}){
   try{
     const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});
@@ -31,7 +50,6 @@ document.querySelectorAll('.nav-item').forEach(item=>{
     $('page-'+pg).classList.add('active');
     const actions={
       dashboard:()=>{ refreshStatus(); refreshAccount(); },
-      logs:()=>{},
       network:loadNetConfig,
       files:loadRawFiles,
       data:loadSchedules,
@@ -96,7 +114,7 @@ function renderLogLine(d){
 
 function clearLog(){ logBox.innerHTML=''; logLines=[]; }
 
-document.querySelectorAll('#page-logs input[type=checkbox]').forEach(cb=>{
+document.querySelectorAll('#log-controls input[type=checkbox]').forEach(cb=>{
   cb.addEventListener('change',()=>{
     logBox.innerHTML='';
     logLines.forEach(renderLogLine);
@@ -163,6 +181,51 @@ function switchFileTab(tab,el){
   if(tab==='raw') loadRawFiles(); else loadConvertedFiles();
 }
 
+function switchFileTabSilently(tab){
+  const btns=document.querySelectorAll('#page-files .tab-btn');
+  btns.forEach(b=>b.classList.remove('active'));
+  if(tab==='raw' && btns[0]) btns[0].classList.add('active');
+  if(tab==='converted' && btns[1]) btns[1].classList.add('active');
+  $('ftab-raw').classList.toggle('hidden',tab!=='raw');
+  $('ftab-converted').classList.toggle('hidden',tab!=='converted');
+}
+
+function fileStem(name){
+  const idx=name.lastIndexOf('.');
+  return idx>0 ? name.slice(0,idx) : name;
+}
+
+function highlightConvertedFile(name){
+  const rows=[...document.querySelectorAll('#conv-tbody tr')];
+  rows.forEach(r=>r.classList.remove('row-highlight'));
+  const row=rows.find(r=>r.textContent.includes(name));
+  if(row){
+    row.classList.add('row-highlight');
+    row.scrollIntoView({behavior:'smooth', block:'center'});
+  }
+}
+
+async function waitForConvertResult(name){
+  const stem=fileStem(name);
+  for(let i=0;i<20;i++){
+    await new Promise(r=>setTimeout(r,800));
+    const st=await api('/api/files/status/'+encodeURIComponent(stem));
+    if(st && st.status==='done'){
+      switchFileTabSilently('converted');
+      await loadConvertedFiles();
+      highlightConvertedFile((st.md_path||'').split(/[\\/]/).pop()||`${stem}.md`);
+      hideActionNotice();
+      return true;
+    }
+    if(st && st.status==='error'){
+      showActionNotice(`《${name}》转化失败，请查看日志`, 'err');
+      return false;
+    }
+  }
+  showActionNotice(`《${name}》转化超时，请稍后在“已转换文件”中查看`, 'err');
+  return false;
+}
+
 async function loadRawFiles(){
   const tb=$('raw-tbody');
   tb.innerHTML='<tr><td colspan="4" style="color:var(--muted)">加载中...</td></tr>';
@@ -179,7 +242,13 @@ async function loadRawFiles(){
 
 async function convertFile(name,btn){
   btn.disabled=true; btn.textContent='转化中...';
+  showActionNotice(`正在转化《${name}》为 Markdown...`, 'info', true);
   const d=await api('/api/files/convert',{method:'POST',body:JSON.stringify({filename:name})});
+  if(d.ok){
+    await waitForConvertResult(name);
+  }else{
+    showActionNotice(d.msg||d.error||'转化失败', 'err');
+  }
   toast(d.ok?d.msg:(d.msg||d.error||'失败'),d.ok);
   btn.disabled=false; btn.textContent='转化为 md';
 }
@@ -206,7 +275,13 @@ async function loadConvertedFiles(){
 
 async function convertConverted(name,btn){
   btn.disabled=true; btn.textContent='转化中...';
+  showActionNotice(`正在重新转化《${name}》为 Markdown...`, 'info', true);
   const d=await api('/api/files/convert',{method:'POST',body:JSON.stringify({filename:name,from_converted:true})});
+  if(d.ok){
+    await waitForConvertResult(name);
+  }else{
+    showActionNotice(d.msg||d.error||'转化失败', 'err');
+  }
   toast(d.ok?d.msg:(d.msg||d.error||'失败'),d.ok);
   btn.disabled=false; btn.textContent='转化为 md';
   if(d.ok) loadConvertedFiles();
@@ -338,22 +413,24 @@ async function editNote(name){
   _editingNote=name;
   $('note-panel-title').textContent='📝 '+d.name;
   $('note-content').value=d.content||'';
-  const p=$('note-panel'); p.classList.remove('hidden'); p.scrollIntoView({behavior:'smooth'});
+  $('note-modal').classList.remove('hidden');
 }
+
+function closeNoteModal(){ $('note-modal').classList.add('hidden'); }
 
 async function saveNote(){
   if(!_editingNote) return;
   const content=$('note-content').value;
   const d=await api('/api/notes/'+encodeURIComponent(_editingNote),{method:'PUT',body:JSON.stringify({content})});
   toast(d.ok?'已保存':(d.error||'失败'),d.ok);
-  if(d.ok) loadNotes();
+  if(d.ok){ closeNoteModal(); loadNotes(); }
 }
 
 async function delNote(name){
   if(!confirm(`确认删除笔记「${name}」？`)) return;
   const d=await api('/api/notes/'+encodeURIComponent(name),{method:'DELETE'});
   toast(d.ok?'已删除':(d.error||'失败'),d.ok);
-  if(d.ok){ loadNotes(); $('note-panel').classList.add('hidden'); }
+  if(d.ok){ loadNotes(); closeNoteModal(); }
 }
 
 // ── Model: Providers ───────────────────────────────────────────────────
@@ -475,14 +552,49 @@ const THEMES=[
    preview:'background:linear-gradient(135deg,#0a0f0d 40%,#10b981 100%)'},
 ];
 
+const GREEN_PRESETS=[
+  '#ecfdf5','#d1fae5','#a7f3d0','#6ee7b7','#34d399','#10b981','#059669','#047857','#065f46','#064e3b',
+  '#f0fdf4','#dcfce7','#bbf7d0','#86efac','#4ade80','#22c55e','#16a34a','#15803d','#166534','#14532d',
+  '#f7fee7','#ecfccb','#d9f99d','#bef264','#a3e635','#84cc16','#65a30d','#4d7c0f','#3f6212','#365314',
+  '#f0fdfa','#ccfbf1','#99f6e4','#5eead4','#2dd4bf','#14b8a6','#0d9488','#0f766e','#115e59','#134e4a',
+  '#f6fff8','#eaffef','#d7fbe1','#c1f7d0','#abf1c0','#95ebb0','#7fe5a1','#69df92','#53d983','#3dd374',
+  '#dafbe1','#aceebb','#7ce38d','#4cd85f','#2fc94f','#1fb141','#179738','#137b30','#106628','#0c511f'
+];
+
 const CSS_VARS=[
-  ['--bg','背景色'],['--surface','卡片背景'],['--surface2','次级背景'],
+  ['--bg','背景色'],['--bg-gradient-a','渐变一'],['--bg-gradient-b','渐变二'],['--bg-gradient-c','渐变三'],['--surface','卡片背景'],['--surface2','次级背景'],
   ['--surface3','高亮背景'],['--border','边框色'],['--text','主文字'],
   ['--muted','次要文字'],['--accent','强调色'],['--accent-h','强调悬停'],
   ['--accent-bg','强调背景'],['--accent-text','强调文字'],
   ['--red','红色'],['--red-bg','红色背景'],
   ['--yellow','黄色'],['--blue','蓝色'],['--green','绿色'],['--orange','橙色'],
 ];
+
+function hexToRgb(hex){
+  const h=hex.replace('#','');
+  const v=h.length===3?h.split('').map(x=>x+x).join(''):h;
+  return {r:parseInt(v.slice(0,2),16),g:parseInt(v.slice(2,4),16),b:parseInt(v.slice(4,6),16)};
+}
+
+function rgbToHex(v){
+  return '#'+[v.r,v.g,v.b].map(x=>Math.max(0,Math.min(255,Math.round(x))).toString(16).padStart(2,'0')).join('');
+}
+
+function mixColor(hex1,hex2,weight){
+  const a=hexToRgb(hex1), b=hexToRgb(hex2);
+  return rgbToHex({r:a.r*(1-weight)+b.r*weight,g:a.g*(1-weight)+b.g*weight,b:a.b*(1-weight)+b.b*weight});
+}
+
+function applyGreenPreset(color){
+  const dark=document.documentElement.getAttribute('data-theme')==='dark';
+  document.documentElement.style.setProperty('--accent', color);
+  document.documentElement.style.setProperty('--green', color);
+  document.documentElement.style.setProperty('--accent-h', mixColor(color, dark?'#ffffff':'#000000', dark?0.12:0.22));
+  document.documentElement.style.setProperty('--accent-bg', mixColor(color, dark?'#0a0f0d':'#ffffff', dark?0.82:0.88));
+  document.documentElement.style.setProperty('--accent-text', mixColor(color, dark?'#ffffff':'#000000', dark?0.25:0.35));
+  document.querySelectorAll('.green-chip').forEach(c=>c.classList.toggle('active', c.dataset.color===color));
+  toast('已应用绿色预设');
+}
 
 function initAppearance(){
   const saved=localStorage.getItem('wb_theme')||'light';
@@ -493,7 +605,6 @@ function initAppearance(){
   </div>`).join('');
 
   const cg=$('color-grid');
-  if(cg.children.length) return;
   cg.innerHTML=CSS_VARS.map(([v,label])=>{
     const color=getComputedStyle(document.documentElement).getPropertyValue(v).trim()||'#888';
     const sid='sw_'+v.replace(/-/g,'_');
@@ -502,6 +613,12 @@ function initAppearance(){
       <div class="color-name">${label}<br><span style="font-size:10px;opacity:.6">${v}</span></div>
     </div>`;
   }).join('');
+
+  const gp=$('green-palette-grid');
+  if(gp){
+    const active=(document.documentElement.style.getPropertyValue('--accent')||getComputedStyle(document.documentElement).getPropertyValue('--accent')).trim().toLowerCase();
+    gp.innerHTML=GREEN_PRESETS.map(color=>`<button class="green-chip${active===color.toLowerCase()?' active':''}" data-color="${color}" style="background:${color}" title="${color}" onclick="applyGreenPreset('${color}')"></button>`).join('');
+  }
 }
 
 function applyTheme(name,el){
@@ -509,6 +626,7 @@ function applyTheme(name,el){
   if(el) el.classList.add('active');
   document.documentElement.setAttribute('data-theme',name);
   localStorage.setItem('wb_theme',name);
+  if($('color-grid')) initAppearance();
   toast('主题已切换');
 }
 

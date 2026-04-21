@@ -76,12 +76,12 @@ copy .env.example .env
 bot 启动后访问 `http://127.0.0.1:5700` 即可打开管理控制台：
 
 - **总览**：微信账号头像/wxid、连接状态、AI 供应商、运行时长、CPU/内存占用，支持手动重连
-- **实时日志**：WebSocket 推流，按级别过滤，自动滚动
+- **实时日志**：SSE 实时推流，按级别过滤，自动滚动
 - **网络配置**：Sub Recorder Token 管理，测试推送
 - **文件管理**：微信缓存原始文件 + 已转换文件，支持「转化为 md」
-- **数据管理**：日程与笔记统一管理，支持查看、编辑、删除
+- **数据管理**：日程与笔记统一管理，日程支持新建/编辑（含日期时间 picker）/删除
 - **模型接口**：AI 供应商切换、API Key 管理、Memory 启用/禁用/编辑
-- **外观配置**：深色/HeroUI 主题切换，自定义 CSS 变量配色
+- **外观配置**：浅色/深色主题切换（浅绿色系默认），17 个 CSS 变量自定义配色，localStorage 持久化
 - **发送消息**：手动向任意 wxid 或群 ID 发送消息
 
 ### 日程提醒
@@ -134,6 +134,30 @@ bot 启动后访问 `http://127.0.0.1:5700` 即可打开管理控制台：
 
 ## CHANGELOG
 
+### v2.0.1 (2026-04-21)
+
+#### WebUI 重设计 + Bug 修复
+
+前端用 Tailwind CSS CDN 完全重写，采用浅绿色（emerald）配色方案，浅色模式为默认，支持深色切换，localStorage 持久化。修复 6 个 bug：① 路由冲突——`/<path:filename>` 通配符拦截 `/api/*` 请求，导致模型接口/Memory/网络配置等页面 JSON 解析错误；② 实时日志改用 SSE（Server-Sent Events）替代 WebSocket，彻底解决跨线程 `ws.send()` 不安全导致日志空白的问题；③ `/api/account` 头像/wxid 字段名适配多种 wcferry 返回格式；④ 新增 `POST /api/schedules` 创建日程，前端日程模块增加「新建日程」按钮和含日期时间 picker 的完整表单；⑤ 外观配置扩充至 17 个 CSS 变量配色项；⑥ 日程编辑支持完整时间字段修改。
+
+---
+
+### v2.0.0 (2026-04-21)
+
+#### Web 管理界面全面升级
+
+WebUI 从仅有基础状态展示扩展为完整的管理控制台。新增网络配置（Sub Recorder Token 管理）、文件管理（两个目录标签页，支持「转化为 md」）、数据管理（日程+笔记合并，均支持编辑）、模型接口（供应商切换、API Key 修改、Memory 启用/禁用/编辑）和外观配置（主题切换、自定义 CSS 变量）。Dashboard 新增 CPU/内存占用和微信账号头像/wxid 展示。后端新增 psutil 系统资源监控，memory 禁用通过 `disabled.json` 持久化，无需修改文件名。
+
+---
+
+### v1.2.0 (2026-04-21)
+
+#### Web 管理界面
+
+用 Flask + flask-sock 替换原有的 `http.server` 实现，新增 Web 管理界面。原有 `/notify`、`/health` 接口保持兼容，Sub Recorder 配置无需改动。前端三个静态文件，无构建步骤，侧边栏导航，日志实时推送，断线后自动重连。
+
+---
+
 ### v1.1.1 (2026-04-10)
 
 #### HTTP 推送服务（Sub Recorder 集成）
@@ -147,34 +171,6 @@ bot 启动后访问 `http://127.0.0.1:5700` 即可打开管理控制台：
 - **`.env` 配置项**：`PUSH_PORT`（监听端口，默认 5700）、`PUSH_TOKEN`（鉴权 Token，可选）
 
 **Sub Recorder 配置方式：** 通知设置 → 添加「微信 Bot」渠道，推送地址填 `http://127.0.0.1:5700/notify`（Docker 内改用 `host.docker.internal`）。
-
----
-
-### v2.0.1 (2026-04-21)
-
-#### WebUI 重设计 + Bug 修复
-
-前端用 Tailwind CSS CDN 完全重写，采用浅绿色（emerald）配色方案，浅色模式为默认，支持深色切换，localStorage 持久化。修复 6 个 bug：① 路由冲突（`/<path:filename>` 通配符拦截 `/api/*` 请求，导致模型接口/Memory/网络配置等页面 JSON 解析错误）；② 实时日志改用 SSE（Server-Sent Events）替代 WebSocket，彻底解决跨线程 `ws.send()` 不安全导致日志空白的问题；③ `/api/account` 头像/wxid 字段名适配多种 wcferry 返回格式；④ 新增 `POST /api/schedules` 创建日程，前端日程模块增加「新建日程」按钮和含日期时间 picker 的完整表单；⑤ 外观配置新增 17 个 CSS 变量配色项；⑥ 日程编辑支持完整时间字段修改。
-
----
-
-### v2.0.0 (2026-04-21)
-
-#### Web 管理界面全面升级
-
-WebUI 从仅有基础状态展示扩展为完整的管理控制台。新增网络配置（Sub Recorder Token 管理）、文件管理（两个目录标签页，支持「转化为 md」）、数据管理（日程+笔记合并，均支持编辑）、模型接口（供应商切换、API Key 修改、Memory 启用/禁用/编辑）和外观配置（深色/HeroUI 主题、自定义 CSS 变量）。Dashboard 新增 CPU/内存占用和微信账号头像/wxid 展示。后端新增 psutil 系统资源监控，memory 禁用通过 `disabled.json` 持久化，无需修改文件名。
-
----
-
-### v1.2.0 (2026-04-21)
-
-#### Web 管理界面
-
-用 Flask + flask-sock 替换原有的 `http.server` 实现，新增 Web 管理界面。原有 `/notify`、`/health` 接口保持兼容，Sub Recorder 配置无需改动。
-
-前端是三个静态文件（`webui/index.html` + `style.css` + `app.js`），无构建步骤，深色主题，侧边栏导航。日志通过 WebSocket 实时推送，断线后自动重连。
-
-新增管理 API：`/api/status`、`/api/reconnect`、`/api/send`、`/api/schedules`（支持 DELETE）、`/api/notes`（支持查看和 DELETE）。
 
 ---
 

@@ -51,7 +51,7 @@ document.querySelectorAll('.nav-item').forEach(item=>{
     const actions={
       dashboard:()=>{ refreshStatus(); refreshAccount(); },
       network:loadNetConfig,
-      files:loadRawFiles,
+      files:()=>{ loadRawFiles(); loadConvertQueue().then(()=>{ if(hasActiveQueue()) startQueuePolling(); }); },
       data:loadSchedules,
       model:()=>{ loadProviders(); loadKeys(); loadMemory(); },
       appearance:initAppearance,
@@ -175,55 +175,21 @@ function copyPushUrl(){
 // ── Files ──────────────────────────────────────────────────────────────
 function switchFileTab(tab,el){
   document.querySelectorAll('#page-files .tab-btn').forEach(b=>b.classList.remove('active'));
-  el.classList.add('active');
+  if(el) el.classList.add('active');
   $('ftab-raw').classList.toggle('hidden',tab!=='raw');
   $('ftab-converted').classList.toggle('hidden',tab!=='converted');
-  if(tab==='raw') loadRawFiles(); else loadConvertedFiles();
+  $('ftab-queue').classList.toggle('hidden',tab!=='queue');
+  if(tab==='raw') loadRawFiles();
+  else if(tab==='converted') loadConvertedFiles();
+  else if(tab==='queue') loadConvertQueue();
 }
 
-function switchFileTabSilently(tab){
+function switchFileTabByName(tab){
   const btns=document.querySelectorAll('#page-files .tab-btn');
-  btns.forEach(b=>b.classList.remove('active'));
-  if(tab==='raw' && btns[0]) btns[0].classList.add('active');
-  if(tab==='converted' && btns[1]) btns[1].classList.add('active');
-  $('ftab-raw').classList.toggle('hidden',tab!=='raw');
-  $('ftab-converted').classList.toggle('hidden',tab!=='converted');
-}
-
-function fileStem(name){
-  const idx=name.lastIndexOf('.');
-  return idx>0 ? name.slice(0,idx) : name;
-}
-
-function highlightConvertedFile(name){
-  const rows=[...document.querySelectorAll('#conv-tbody tr')];
-  rows.forEach(r=>r.classList.remove('row-highlight'));
-  const row=rows.find(r=>r.textContent.includes(name));
-  if(row){
-    row.classList.add('row-highlight');
-    row.scrollIntoView({behavior:'smooth', block:'center'});
-  }
-}
-
-async function waitForConvertResult(name){
-  const stem=fileStem(name);
-  for(let i=0;i<20;i++){
-    await new Promise(r=>setTimeout(r,800));
-    const st=await api('/api/files/status/'+encodeURIComponent(stem));
-    if(st && st.status==='done'){
-      switchFileTabSilently('converted');
-      await loadConvertedFiles();
-      highlightConvertedFile((st.md_path||'').split(/[\\/]/).pop()||`${stem}.md`);
-      hideActionNotice();
-      return true;
-    }
-    if(st && st.status==='error'){
-      showActionNotice(`《${name}》转化失败，请查看日志`, 'err');
-      return false;
-    }
-  }
-  showActionNotice(`《${name}》转化超时，请稍后在“已转换文件”中查看`, 'err');
-  return false;
+  const map={raw:0,converted:1,queue:2};
+  const idx=map[tab];
+  if(idx==null) return;
+  switchFileTab(tab, btns[idx]);
 }
 
 async function loadRawFiles(){
@@ -236,21 +202,22 @@ async function loadRawFiles(){
     <td class="font-mono text-xs">${esc(f.name)}</td>
     <td style="color:var(--muted)">${fmtBytes(f.size)}</td>
     <td style="color:var(--muted)">${fmtTime(f.mtime)}</td>
-    <td class="td-actions"><button class="btn btn-ghost btn-sm" onclick="convertFile('${esc(f.name)}',this)">转化为 md</button></td>
+    <td class="td-actions"><button class="btn btn-ghost btn-sm" onclick="convertFile('${esc(f.name)}',this)">加入队列</button></td>
   </tr>`).join('');
 }
 
 async function convertFile(name,btn){
-  btn.disabled=true; btn.textContent='转化中...';
-  showActionNotice(`正在转化《${name}》为 Markdown...`, 'info', true);
+  btn.disabled=true; btn.textContent='加入中...';
   const d=await api('/api/files/convert',{method:'POST',body:JSON.stringify({filename:name})});
   if(d.ok){
-    await waitForConvertResult(name);
+    showActionNotice(`《${name}》已加入转换队列`, 'info');
+    switchFileTabByName('queue');
+    startQueuePolling();
   }else{
-    showActionNotice(d.msg||d.error||'转化失败', 'err');
+    showActionNotice(d.msg||d.error||'加入队列失败', 'err');
   }
-  toast(d.ok?d.msg:(d.msg||d.error||'失败'),d.ok);
-  btn.disabled=false; btn.textContent='转化为 md';
+  toast(d.ok?'已加入队列':(d.msg||d.error||'失败'),d.ok);
+  btn.disabled=false; btn.textContent='加入队列';
 }
 
 const CONVERTABLE_EXTS=new Set(['.docx','.doc','.xlsx','.xls','.pptx','.ppt','.pdf','.txt']);
@@ -268,23 +235,23 @@ async function loadConvertedFiles(){
       <td class="font-mono text-xs">${esc(f.name)}</td>
       <td style="color:var(--muted)">${fmtBytes(f.size)}</td>
       <td style="color:var(--muted)">${fmtTime(f.mtime)}</td>
-      <td class="td-actions">${canConvert?`<button class="btn btn-ghost btn-sm" onclick="convertConverted('${esc(f.name)}',this)">转化为 md</button>`:''}<button class="btn btn-danger btn-sm" onclick="delConverted('${esc(f.name)}')">删除</button></td>
+      <td class="td-actions">${canConvert?`<button class="btn btn-ghost btn-sm" onclick="convertConverted('${esc(f.name)}',this)">重新转化</button>`:''}<button class="btn btn-danger btn-sm" onclick="delConverted('${esc(f.name)}')">删除</button></td>
     </tr>`;
   }).join('');
 }
 
 async function convertConverted(name,btn){
-  btn.disabled=true; btn.textContent='转化中...';
-  showActionNotice(`正在重新转化《${name}》为 Markdown...`, 'info', true);
+  btn.disabled=true; btn.textContent='加入中...';
   const d=await api('/api/files/convert',{method:'POST',body:JSON.stringify({filename:name,from_converted:true})});
   if(d.ok){
-    await waitForConvertResult(name);
+    showActionNotice(`《${name}》已加入转换队列`, 'info');
+    switchFileTabByName('queue');
+    startQueuePolling();
   }else{
-    showActionNotice(d.msg||d.error||'转化失败', 'err');
+    showActionNotice(d.msg||d.error||'加入队列失败', 'err');
   }
-  toast(d.ok?d.msg:(d.msg||d.error||'失败'),d.ok);
-  btn.disabled=false; btn.textContent='转化为 md';
-  if(d.ok) loadConvertedFiles();
+  toast(d.ok?'已加入队列':(d.msg||d.error||'失败'),d.ok);
+  btn.disabled=false; btn.textContent='重新转化';
 }
 
 async function delConverted(name){
@@ -292,6 +259,115 @@ async function delConverted(name){
   const d=await api('/api/files/converted/'+encodeURIComponent(name),{method:'DELETE'});
   toast(d.ok?'已删除':(d.error||'失败'),d.ok);
   if(d.ok) loadConvertedFiles();
+}
+
+// ── Convert Queue ──────────────────────────────────────────────────────
+let _queuePollTimer=null;
+let _lastQueueIds=new Set();
+
+function statusBadge(st){
+  if(st==='converting') return '<span class="q-badge q-converting"><span class="q-spinner"></span>正在转化</span>';
+  if(st==='done') return '<span class="q-badge q-done">转化成功</span>';
+  if(st==='error') return '<span class="q-badge q-error">转化失败</span>';
+  return `<span class="q-badge q-gray">${esc(st||'未知')}</span>`;
+}
+
+function renderQueueItem(it){
+  const actions=[];
+  if(it.status==='done'){
+    actions.push(`<button class="btn btn-primary btn-sm" onclick="confirmQueueItem('${it.id}',this)">确认</button>`);
+    actions.push(`<button class="btn btn-ghost btn-sm" onclick="cancelQueueItem('${it.id}',this)">取消</button>`);
+  }else if(it.status==='error'){
+    actions.push(`<button class="btn btn-ghost btn-sm" onclick="cancelQueueItem('${it.id}',this)">移除</button>`);
+  }
+  const errLine=it.status==='error' && it.error ? `<div class="q-err">${esc(it.error)}</div>`:'';
+  const mdLine=it.status==='done' && it.md_name ? `<div class="q-md">暂存：<code>${esc(it.md_name)}</code></div>`:'';
+  const isNew=!_lastQueueIds.has(it.id);
+  return `<div class="queue-item ${isNew?'q-new':''}" data-id="${it.id}" data-status="${it.status}">
+    <div class="q-main">
+      <div class="q-name"><span class="q-file-icon">📄</span>${esc(it.name)}</div>
+      <div class="q-src" title="${esc(it.src_path)}">来源：<code>${esc(it.src_path)}</code></div>
+      ${mdLine}${errLine}
+    </div>
+    <div class="q-side">
+      ${statusBadge(it.status)}
+      <div class="q-actions">${actions.join('')}</div>
+    </div>
+  </div>`;
+}
+
+function updateQueueBadge(n){
+  const b=$('queue-count');
+  if(!b) return;
+  if(n>0){ b.textContent=n; b.classList.remove('hidden'); }
+  else { b.classList.add('hidden'); }
+}
+
+async function loadConvertQueue(){
+  const el=$('queue-list');
+  if(!el) return;
+  const d=await api('/api/convert/queue');
+  if(d.error || !Array.isArray(d)){
+    el.innerHTML=`<div class="q-empty">${esc(d.error||'加载失败')}</div>`;
+    updateQueueBadge(0);
+    return;
+  }
+  updateQueueBadge(d.length);
+  if(!d.length){
+    el.innerHTML='<div class="q-empty">暂无转换任务</div>';
+    _lastQueueIds=new Set();
+    return;
+  }
+  // 稍后到早，最新的放最上
+  const sorted=[...d].sort((a,b)=>(b.created_at||0)-(a.created_at||0));
+  el.innerHTML=sorted.map(renderQueueItem).join('');
+  _lastQueueIds=new Set(sorted.map(x=>x.id));
+}
+
+function hasActiveQueue(){
+  return document.querySelectorAll('#queue-list .queue-item[data-status="converting"]').length>0;
+}
+
+function startQueuePolling(){
+  if(_queuePollTimer) return;
+  loadConvertQueue();
+  _queuePollTimer=setInterval(async()=>{
+    await loadConvertQueue();
+    // 当前没有转化中且页面不在文件队列 tab 时，停止轮询
+    const onQueueTab=!$('ftab-queue').classList.contains('hidden') && $('page-files').classList.contains('active');
+    if(!hasActiveQueue() && !onQueueTab){
+      stopQueuePolling();
+    }
+  },2000);
+}
+
+function stopQueuePolling(){
+  if(_queuePollTimer){ clearInterval(_queuePollTimer); _queuePollTimer=null; }
+}
+
+async function confirmQueueItem(id,btn){
+  if(btn){ btn.disabled=true; }
+  const d=await api('/api/convert/confirm',{method:'POST',body:JSON.stringify({id})});
+  if(d.ok){
+    toast('已归档到 memory/files/');
+    showActionNotice(`已确认：${d.md_name||''}`, 'ok');
+    await loadConvertQueue();
+  }else{
+    toast(d.msg||'失败',false);
+    if(btn) btn.disabled=false;
+  }
+}
+
+async function cancelQueueItem(id,btn){
+  if(btn){ btn.disabled=true; }
+  const d=await api('/api/convert/cancel',{method:'POST',body:JSON.stringify({id})});
+  if(d.ok){
+    toast('已取消并删除暂存');
+    await loadConvertQueue();
+  }else{
+    toast(d.msg||'失败',false);
+    if(btn) btn.disabled=false;
+  }
 }
 
 // ── Data: tabs ─────────────────────────────────────────────────────────
@@ -676,3 +752,23 @@ loadSavedAppearance();
 refreshStatus();
 refreshAccount();
 setInterval(refreshStatus,15000);
+// 首屏静默刷新一次队列徽章；若有活动任务则开启轮询
+loadConvertQueue().then(()=>{ if(hasActiveQueue()) startQueuePolling(); });
+
+// ── Sidebar toggle (mobile) ───────────────────────────────────────────
+function toggleSidebar(){
+  document.body.classList.toggle('sidebar-open');
+}
+document.addEventListener('click', e=>{
+  if(window.innerWidth>900) return;
+  const sb=$('sidebar');
+  if(!sb) return;
+  if(document.body.classList.contains('sidebar-open')
+     && !sb.contains(e.target)
+     && !e.target.closest('#sidebar-toggle')){
+    document.body.classList.remove('sidebar-open');
+  }
+});
+document.querySelectorAll('.nav-item').forEach(n=>n.addEventListener('click',()=>{
+  if(window.innerWidth<=900) document.body.classList.remove('sidebar-open');
+}));

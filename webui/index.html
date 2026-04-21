@@ -10,6 +10,13 @@
 </head>
 <body class="bg-bg text-text flex h-screen overflow-hidden font-sans antialiased">
 
+  <!-- Mobile sidebar toggle -->
+  <button id="sidebar-toggle" class="sidebar-toggle" onclick="toggleSidebar()" aria-label="菜单">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+  </button>
+
+  <div class="sidebar-backdrop" onclick="toggleSidebar()"></div>
+
   <!-- ── Sidebar ── -->
  <aside id="sidebar" class="w-56 shrink-0 flex flex-col bg-surface border-r border-border">
    <!-- Brand -->
@@ -178,6 +185,9 @@
       <div class="tabs-bar">
         <button class="tab-btn active" onclick="switchFileTab('raw',this)">微信缓存原始文件</button>
         <button class="tab-btn" onclick="switchFileTab('converted',this)">已转换文件</button>
+        <button class="tab-btn" onclick="switchFileTab('queue',this)">
+          转换队列<span id="queue-count" class="tab-badge hidden">0</span>
+        </button>
       </div>
       <div id="ftab-raw" class="card mt-0 rounded-tl-none">
         <div class="flex justify-between items-center mb-3">
@@ -194,6 +204,13 @@
         </div>
         <div class="table-wrap"><table><thead><tr><th>文件名</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead>
         <tbody id="conv-tbody"></tbody></table></div>
+      </div>
+      <div id="ftab-queue" class="card mt-0 rounded-tl-none hidden">
+        <div class="flex justify-between items-center mb-3">
+          <span class="text-xs text-muted">UI 手动转换的任务会先写入暂存区，确认后才会归档到 memory/files/</span>
+          <button class="btn btn-ghost btn-sm" onclick="loadConvertQueue()">刷新</button>
+        </div>
+        <div id="queue-list" class="queue-list"></div>
       </div>
     </div>
   </div>

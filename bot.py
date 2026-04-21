@@ -12,7 +12,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import queue
 from queue import Empty
-from threading import Thread
+from threading import Thread, Lock
+import uuid
 from dotenv import load_dotenv
 from openai import OpenAI
 from wcferry import Wcf, WxMsg
@@ -65,6 +66,8 @@ MEMORY_DIR = Path(os.getenv("MEMORY_DIR", r"D:\Weixin\bot\memory"))
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 FILE_SAVE_DIR = MEMORY_DIR / "files"
 FILE_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+PENDING_DIR = FILE_SAVE_DIR / ".pending"
+PENDING_DIR.mkdir(parents=True, exist_ok=True)
 NOTES_DIR = MEMORY_DIR / "notes"
 NOTES_DIR.mkdir(parents=True, exist_ok=True)
 SCHEDULES_DB = MEMORY_DIR / "schedules.db"
@@ -496,6 +499,39 @@ _watched_files: set = set()  # 已处理过的文件路径集合
 _file_convert_status: dict = {}  # stem -> {"status": "converting"/"done"/"error", "path": str, "md_path": str}
 _new_files_pending: list = []   # 断线期间检测到的新文件，重连后通知用户
 
+# ── UI 手动转换队列 ─────────────────────────────────────────
+# 每项: {id, name, stem, src_path, status, md_path, md_name, error, created_at}
+# status: converting / done / error
+_convert_queue: list = []
+_convert_queue_lock = Lock()
+
+
+def _queue_add(item: dict) -> None:
+    with _convert_queue_lock:
+        _convert_queue.append(item)
+
+
+def _queue_update(qid, **fields):
+    with _convert_queue_lock:
+        for it in _convert_queue:
+            if it["id"] == qid:
+                it.update(fields)
+                return dict(it)
+    return None
+
+
+def _queue_remove(qid):
+    with _convert_queue_lock:
+        for i, it in enumerate(_convert_queue):
+            if it["id"] == qid:
+                return _convert_queue.pop(i)
+    return None
+
+
+def _queue_snapshot() -> list:
+    with _convert_queue_lock:
+        return [dict(it) for it in _convert_queue]
+
 # ── 重连后从微信数据库恢复文件 ──
 _last_recover_ts_file = MEMORY_DIR / ".last_recover_ts"
 
@@ -792,6 +828,38 @@ def _convert_and_save(src: Path) -> Path:
     _file_convert_status[stem]["md_path"] = str(save_path)
     LOG.info(f"[转换] 完成: {save_path}，{len(md_text)} 字符")
     return save_path
+
+
+def _convert_to_staging(src: Path, qid: str):
+    """把 src 转换为 Markdown 后写入 PENDING_DIR，状态写入队列项。
+    用户在 Web 侧点击"确认"后再通过 _queue_confirm 移入 FILE_SAVE_DIR。"""
+    stem = src.stem
+    try:
+        tmp_path = PENDING_DIR / src.name
+        work_path = tmp_path
+        if src.resolve() != tmp_path.resolve():
+            shutil.copy2(str(src), tmp_path)
+        else:
+            work_path = src
+        md_text, _ = convert_to_markdown(str(work_path))
+        if (work_path.suffix.lower() not in (".md", ".txt")
+                and work_path.exists()
+                and work_path.resolve() != src.resolve()):
+            try:
+                work_path.unlink()
+            except Exception:
+                pass
+        if not md_text:
+            _queue_update(qid, status="error", error="文件解析为空")
+            LOG.warning(f"[转换] 解析为空: {src.name}")
+            return
+        save_path = PENDING_DIR / f"{stem}.md"
+        save_path.write_text(md_text, encoding="utf-8")
+        _queue_update(qid, status="done", md_path=str(save_path), md_name=save_path.name)
+        LOG.info(f"[转换] 暂存完成: {save_path}，{len(md_text)} 字符（等待确认）")
+    except Exception as e:
+        LOG.error(f"[转换] 失败 {src.name}: {e}", exc_info=True)
+        _queue_update(qid, status="error", error=str(e))
 
 
 def _try_write_env(key: str, value: str):
@@ -1820,8 +1888,9 @@ class _SseLogHandler(logging.Handler):
         if not _sse_log_clients:
             return
         try:
+            t_str = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
             entry = json.dumps({
-                "t": self.formatTime(record, "%H:%M:%S"),
+                "t": t_str,
                 "lvl": record.levelname,
                 "msg": self.format(record),
             }, ensure_ascii=False)
@@ -2092,13 +2161,79 @@ def _push_server():
                     break
         if src is None or not src.exists():
             return jsonify({"ok": False, "msg": "file not found"}), 404
-        def _do_convert():
+        # 已在队列中的同路径任务（仍在转化/已完成但未确认）则直接复用
+        src_str = str(src)
+        existing = next((it for it in _queue_snapshot() if it.get("src_path") == src_str), None)
+        if existing and existing.get("status") in ("converting", "done"):
+            return jsonify({"ok": True, "id": existing["id"], "msg": "该文件已在队列中"})
+        qid = uuid.uuid4().hex[:12]
+        item = {
+            "id": qid,
+            "name": src.name,
+            "stem": src.stem,
+            "src_path": src_str,
+            "status": "converting",
+            "md_path": "",
+            "md_name": "",
+            "error": "",
+            "created_at": int(time.time()),
+        }
+        _queue_add(item)
+        LOG.info(f"[队列] 新增转换任务: {src.name} (id={qid})")
+        Thread(target=lambda: _convert_to_staging(src, qid), daemon=True).start()
+        return jsonify({"ok": True, "id": qid, "msg": f"已加入转换队列"})
+
+    # ── 转换队列 ────────────────────────────────────────────────────────
+    @app.route("/api/convert/queue")
+    def api_convert_queue():
+        return jsonify(_queue_snapshot())
+
+    @app.route("/api/convert/confirm", methods=["POST"])
+    def api_convert_confirm():
+        body = request.get_json(silent=True) or {}
+        qid = str(body.get("id", "")).strip()
+        if not qid:
+            return jsonify({"ok": False, "msg": "missing id"}), 400
+        with _convert_queue_lock:
+            item = next((it for it in _convert_queue if it["id"] == qid), None)
+            if not item:
+                return jsonify({"ok": False, "msg": "not found"}), 404
+            if item.get("status") != "done":
+                return jsonify({"ok": False, "msg": "未完成或已失败，无法确认"}), 400
+            item_copy = dict(item)
+        try:
+            src_md = Path(item_copy.get("md_path", ""))
+            if not src_md.exists():
+                _queue_remove(qid)
+                return jsonify({"ok": False, "msg": "暂存文件不存在"}), 404
+            dst = FILE_SAVE_DIR / src_md.name
+            shutil.move(str(src_md), str(dst))
+            _queue_remove(qid)
+            LOG.info(f"[队列] 确认归档: {dst}")
+            return jsonify({"ok": True, "md_name": dst.name})
+        except Exception as e:
+            LOG.error(f"[队列] 确认失败: {e}", exc_info=True)
+            return jsonify({"ok": False, "msg": str(e)}), 500
+
+    @app.route("/api/convert/cancel", methods=["POST"])
+    def api_convert_cancel():
+        body = request.get_json(silent=True) or {}
+        qid = str(body.get("id", "")).strip()
+        if not qid:
+            return jsonify({"ok": False, "msg": "missing id"}), 400
+        item = _queue_remove(qid)
+        if not item:
+            return jsonify({"ok": False, "msg": "not found"}), 404
+        md_path = item.get("md_path") or ""
+        if md_path:
             try:
-                _convert_and_save(src)
+                p = Path(md_path)
+                if p.exists():
+                    p.unlink()
+                    LOG.info(f"[队列] 取消并删除暂存: {p}")
             except Exception as e:
-                LOG.error(f"[WebUI] 转换失败: {e}")
-        Thread(target=_do_convert, daemon=True).start()
-        return jsonify({"ok": True, "msg": f"已开始转换 {filename}"})
+                LOG.warning(f"[队列] 取消时删除暂存失败: {e}")
+        return jsonify({"ok": True})
 
     @app.route("/api/files/converted/<path:name>", methods=["DELETE"])
     def api_delete_converted(name):

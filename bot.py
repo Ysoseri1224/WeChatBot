@@ -10,6 +10,7 @@ import subprocess
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+import queue
 from queue import Empty
 from threading import Thread
 from dotenv import load_dotenv
@@ -1688,29 +1689,28 @@ PUSH_PORT  = int(os.getenv("PUSH_PORT", "5700"))
 PUSH_TOKEN = os.getenv("PUSH_TOKEN", "").strip()
 _push_server_started  = False
 _push_worker_started  = False
-_push_queue: "queue.Queue" = None  # type: ignore  # 延迟初始化避免循环导入
+_push_queue = None  # 延迟初始化
+_bot_start_time = time.time()
+_ws_log_clients: list = []  # 已连接的 WebSocket 日志订阅者
 
 
 def _ensure_push_queue():
     global _push_queue
     if _push_queue is None:
-        import queue as _q
-        _push_queue = _q.Queue(maxsize=200)
+        _push_queue = queue.Queue(maxsize=200)
     return _push_queue
 
 
 def _push_send_worker():
-    """**单独线程**消费推送队列，微信断开时暂停等待而不丢弃消息"""
-    import queue as _q
+    """单独线程消费推送队列，微信断开时暂停等待而不丢弃消息"""
     q = _ensure_push_queue()
     LOG.info("[Push] 发送 worker 已启动")
     while True:
         try:
             to, msg = q.get(timeout=2)
-        except _q.Empty:
+        except queue.Empty:
             continue
-
-        while True:  # 重试直到发送成功
+        while True:
             wcf = _global_wcf
             if wcf is not None:
                 try:
@@ -1726,64 +1726,187 @@ def _push_send_worker():
                 time.sleep(3)
 
 
+# ── WebSocket 日志广播 Handler ───────────────────────────────────────────
+class _WsLogHandler(logging.Handler):
+    """把日志推送到所有已连接的 WebSocket 客户端"""
+    def emit(self, record):
+        if not _ws_log_clients:
+            return
+        try:
+            entry = json.dumps({
+                "t": self.formatTime(record, "%H:%M:%S"),
+                "lvl": record.levelname,
+                "msg": self.format(record),
+            }, ensure_ascii=False)
+        except Exception:
+            return
+        dead = []
+        for ws in list(_ws_log_clients):
+            try:
+                ws.send(entry)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            _ws_log_clients.discard(ws) if hasattr(_ws_log_clients, "discard") else None
+            try:
+                _ws_log_clients.remove(ws)
+            except ValueError:
+                pass
+
+
 def _push_server():
-    """HTTP 轻量服务，接收外部推送请求并入队"""
-    import json as _json
-    from http.server import HTTPServer, BaseHTTPRequestHandler
+    """Flask Web 管理界面 + HTTP 推送服务"""
+    from flask import Flask, request, jsonify, send_from_directory
+    from flask_sock import Sock
 
     q = _ensure_push_queue()
+    app = Flask(__name__, static_folder=None)
+    sock = Sock(app)
 
-    class _Handler(BaseHTTPRequestHandler):
-        def log_message(self, fmt, *args):  # 屏蔽默认 access log
-            LOG.debug(f"[Push] {fmt % args}")
+    import logging as _logging
+    _ws_handler = _WsLogHandler()
+    _ws_handler.setFormatter(logging.Formatter("%(message)s"))
+    _logging.getLogger().addHandler(_ws_handler)
 
-        def _send_json(self, code: int, data: dict):
-            payload = _json.dumps(data).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+    webui_dir = Path(__file__).parent / "webui"
 
-        def do_GET(self):
-            if self.path == "/health":
-                status = "connected" if _global_wcf else "disconnected"
-                self._send_json(200, {"ok": True, "wechat": status, "queue": q.qsize()})
-            else:
-                self._send_json(404, {"ok": False, "msg": "not found"})
+    # ── 静态文件 ────────────────────────────────────────────────────────
+    @app.route("/")
+    def index():
+        return send_from_directory(str(webui_dir), "index.html")
 
-        def do_POST(self):
-            if self.path != "/notify":
-                self._send_json(404, {"ok": False, "msg": "not found"})
-                return
+    @app.route("/<path:filename>")
+    def static_files(filename):
+        return send_from_directory(str(webui_dir), filename)
+
+    # ── 兼容旧接口 ──────────────────────────────────────────────────────
+    @app.route("/health")
+    def health():
+        status = "connected" if _global_wcf else "disconnected"
+        return jsonify({"ok": True, "wechat": status, "queue": q.qsize()})
+
+    @app.route("/notify", methods=["POST"])
+    def notify():
+        body = request.get_json(silent=True) or {}
+        if PUSH_TOKEN and body.get("token", "") != PUSH_TOKEN:
+            return jsonify({"ok": False, "msg": "unauthorized"}), 401
+        to  = str(body.get("to",  "")).strip()
+        msg = str(body.get("msg", "")).strip()
+        if not to or not msg:
+            return jsonify({"ok": False, "msg": "missing to or msg"}), 400
+        if q.full():
+            return jsonify({"ok": False, "msg": "queue full"}), 503
+        q.put((to, msg))
+        LOG.info(f"[Push] 收到推送请求 -> {to}，队列长度: {q.qsize()}")
+        return jsonify({"ok": True, "queued": q.qsize()})
+
+    # ── 管理 API ────────────────────────────────────────────────────────
+    @app.route("/api/status")
+    def api_status():
+        uptime = int(time.time() - _bot_start_time)
+        h, r = divmod(uptime, 3600)
+        m, s = divmod(r, 60)
+        return jsonify({
+            "wechat": "connected" if _global_wcf else "disconnected",
+            "ai_provider": AI_PROVIDER,
+            "ai_model": AI_MODEL,
+            "uptime": f"{h:02d}:{m:02d}:{s:02d}",
+            "queue": q.qsize(),
+        })
+
+    @app.route("/api/reconnect", methods=["POST"])
+    def api_reconnect():
+        wcf = _global_wcf
+        if wcf:
             try:
-                length = int(self.headers.get("Content-Length", 0))
-                body = _json.loads(self.rfile.read(length) or b"{}")
+                wcf.cleanup()
             except Exception:
-                self._send_json(400, {"ok": False, "msg": "invalid json"})
-                return
+                pass
+        return jsonify({"ok": True, "msg": "重连信号已发送，请等待 bot 自动重连"})
 
-            if PUSH_TOKEN and body.get("token", "") != PUSH_TOKEN:
-                self._send_json(401, {"ok": False, "msg": "unauthorized"})
-                return
+    @app.route("/api/send", methods=["POST"])
+    def api_send():
+        body = request.get_json(silent=True) or {}
+        to  = str(body.get("to",  "")).strip()
+        msg = str(body.get("msg", "")).strip()
+        if not to or not msg:
+            return jsonify({"ok": False, "msg": "missing to or msg"}), 400
+        if q.full():
+            return jsonify({"ok": False, "msg": "queue full"}), 503
+        q.put((to, msg))
+        return jsonify({"ok": True, "queued": q.qsize()})
 
-            to  = str(body.get("to",  "")).strip()
-            msg = str(body.get("msg", "")).strip()
-            if not to or not msg:
-                self._send_json(400, {"ok": False, "msg": "missing to or msg"})
-                return
+    @app.route("/api/schedules")
+    def api_schedules():
+        try:
+            conn = sqlite3.connect(str(SCHEDULES_DB))
+            rows = conn.execute(
+                "SELECT id, name, year, month, day, hour, minute, weekday, content, reminded_morning, reminded_before, created_at "
+                "FROM schedules ORDER BY year,month,day,hour,minute"
+            ).fetchall()
+            conn.close()
+            result = []
+            for r in rows:
+                result.append({
+                    "id": r[0], "name": r[1],
+                    "datetime": f"{r[2]}/{r[3]:02d}/{r[4]:02d} {r[5]:02d}:{r[6]:02d}",
+                    "weekday": f"周{WEEKDAYS_ZH[r[7]]}" if r[7] is not None else "",
+                    "content": r[8] or "",
+                    "reminded_morning": bool(r[9]), "reminded_before": bool(r[10]),
+                    "created_at": r[11],
+                })
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
-            if q.full():
-                self._send_json(503, {"ok": False, "msg": "queue full"})
-                return
+    @app.route("/api/schedules/<int:sid>", methods=["DELETE"])
+    def api_delete_schedule(sid):
+        try:
+            conn = sqlite3.connect(str(SCHEDULES_DB))
+            conn.execute("DELETE FROM schedules WHERE id=?", (sid,))
+            conn.commit()
+            conn.close()
+            return jsonify({"ok": True})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
-            q.put((to, msg))
-            LOG.info(f"[Push] 收到推送请求 -> {to}，队列长度: {q.qsize()}")
-            self._send_json(200, {"ok": True, "queued": q.qsize()})
+    @app.route("/api/notes")
+    def api_notes():
+        files = sorted(NOTES_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return jsonify([{"name": p.stem, "mtime": int(p.stat().st_mtime)} for p in files])
 
-    server = HTTPServer(("127.0.0.1", PUSH_PORT), _Handler)
-    LOG.info(f"[Push] HTTP 推送服务已启动: http://127.0.0.1:{PUSH_PORT}/notify")
-    server.serve_forever()
+    @app.route("/api/notes/<name>")
+    def api_note_read(name):
+        text, stem = note_read(name)
+        if text is None:
+            return jsonify({"error": "not found"}), 404
+        return jsonify({"name": stem, "content": text})
+
+    @app.route("/api/notes/<name>", methods=["DELETE"])
+    def api_delete_note(name):
+        matches = [p for p in NOTES_DIR.glob("*.txt") if p.stem.lower() == name.lower()]
+        if not matches:
+            return jsonify({"error": "not found"}), 404
+        matches[0].unlink()
+        return jsonify({"ok": True})
+
+    # ── WebSocket 日志流 ────────────────────────────────────────────────
+    @sock.route("/ws/logs")
+    def ws_logs(ws):
+        _ws_log_clients.append(ws)
+        try:
+            while True:
+                ws.receive(timeout=30)
+        except Exception:
+            pass
+        finally:
+            try:
+                _ws_log_clients.remove(ws)
+            except ValueError:
+                pass
+
+    LOG.info(f"[WebUI] 管理界面已启动: http://127.0.0.1:{PUSH_PORT}")
+    app.run(host="0.0.0.0", port=PUSH_PORT, debug=False, use_reloader=False)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WeChatBot 管理</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Sidebar -->
+<nav id="sidebar">
+  <div class="sidebar-logo">
+    <h1>WeChatBot</h1>
+    <span>管理控制台</span>
+  </div>
+
+  <div class="nav-item active" data-page="dashboard">
+    <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+    总览
+  </div>
+  <div class="nav-item" data-page="logs">
+    <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 6h16M4 10h16M4 14h10"/></svg>
+    实时日志
+  </div>
+  <div class="nav-item" data-page="schedules">
+    <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+    日程
+  </div>
+  <div class="nav-item" data-page="notes">
+    <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
+    笔记
+  </div>
+  <div class="nav-item" data-page="send">
+    <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+    发送消息
+  </div>
+
+  <div class="sidebar-footer" id="ws-status">● 连接中...</div>
+</nav>
+
+<!-- Main -->
+<div id="main">
+
+  <!-- ── Dashboard ── -->
+  <div class="page active" id="page-dashboard">
+    <div class="status-grid" id="status-grid">
+      <div class="stat-card">
+        <div class="stat-label">微信连接</div>
+        <div class="stat-value" id="stat-wechat">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">AI 供应商</div>
+        <div class="stat-value mono" id="stat-ai">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">运行时长</div>
+        <div class="stat-value mono" id="stat-uptime">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">推送队列</div>
+        <div class="stat-value mono" id="stat-queue">—</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">操作</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-ghost" onclick="refreshStatus()">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+          刷新状态
+        </button>
+        <button class="btn btn-danger" onclick="reconnect()">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+          重连微信
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Logs ── -->
+  <div class="page" id="page-logs">
+    <div class="card">
+      <div class="card-title">实时日志</div>
+      <div class="log-controls" style="margin-bottom:12px">
+        <label><input type="checkbox" id="filter-debug" checked> DEBUG</label>
+        <label><input type="checkbox" id="filter-info" checked> INFO</label>
+        <label><input type="checkbox" id="filter-warning" checked> WARNING</label>
+        <label><input type="checkbox" id="filter-error" checked> ERROR</label>
+        <label style="margin-left:auto"><input type="checkbox" id="autoscroll" checked> 自动滚动</label>
+        <button class="btn btn-ghost btn-sm" onclick="clearLog()">清空</button>
+      </div>
+      <div id="log-box"></div>
+    </div>
+  </div>
+
+  <!-- ── Schedules ── -->
+  <div class="page" id="page-schedules">
+    <div class="card">
+      <div class="card-title">日程列表</div>
+      <div id="schedules-wrap">
+        <table>
+          <thead>
+            <tr><th>名称</th><th>时间</th><th>星期</th><th>内容</th><th>提醒</th><th></th></tr>
+          </thead>
+          <tbody id="schedules-tbody"></tbody>
+        </table>
+      </div>
+      <div style="margin-top:12px">
+        <button class="btn btn-ghost btn-sm" onclick="loadSchedules()">刷新</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Notes ── -->
+  <div class="page" id="page-notes">
+    <div class="card">
+      <div class="card-title">笔记列表</div>
+      <table>
+        <thead><tr><th>名称</th><th>修改时间</th><th></th></tr></thead>
+        <tbody id="notes-tbody"></tbody>
+      </table>
+      <div style="margin-top:12px">
+        <button class="btn btn-ghost btn-sm" onclick="loadNotes()">刷新</button>
+      </div>
+    </div>
+
+    <div class="card" id="note-viewer" style="display:none">
+      <div class="card-title" id="note-viewer-title">笔记内容</div>
+      <div id="note-content-box"></div>
+      <div style="margin-top:10px">
+        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('note-viewer').style.display='none'">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Send ── -->
+  <div class="page" id="page-send">
+    <div class="card">
+      <div class="card-title">发送消息</div>
+      <div style="display:flex;flex-direction:column;gap:12px;max-width:520px">
+        <div>
+          <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">接收方 wxid 或群 ID</div>
+          <input type="text" id="send-to" placeholder="wxid_xxx 或 54105533396@chatroom" style="width:100%">
+        </div>
+        <div>
+          <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">消息内容</div>
+          <textarea id="send-msg" placeholder="输入消息内容..." rows="4"></textarea>
+        </div>
+        <div>
+          <button class="btn btn-primary" onclick="sendMsg()">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+            发送
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<div id="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

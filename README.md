@@ -20,7 +20,7 @@ python -m venv venv
 .\venv\Scripts\activate
 
 # 3. 安装依赖
-pip install wcferry python-dotenv openai python-docx pymupdf openpyxl python-pptx
+pip install wcferry python-dotenv openai python-docx pymupdf openpyxl python-pptx flask flask-sock
 
 # 4. 配置环境变量
 copy .env.example .env
@@ -70,6 +70,16 @@ copy .env.example .env
 之后可用 `@bot 总结文件 文件名` 进行提问。
 
 公众号/服务号（`gh_` 前缀）消息会被自动过滤。
+
+### Web 管理界面
+
+bot 启动后访问 `http://127.0.0.1:5700` 即可打开管理控制台：
+
+- **总览**：微信连接状态、AI 供应商、运行时长、推送队列长度，支持手动重连
+- **实时日志**：WebSocket 推流，按级别过滤（DEBUG/INFO/WARNING/ERROR），自动滚动
+- **日程**：列出所有日程，支持删除
+- **笔记**：列出所有笔记，支持查看和删除
+- **发送消息**：手动向任意 wxid 或群 ID 发送消息
 
 ### 日程提醒
 
@@ -134,6 +144,18 @@ copy .env.example .env
 - **`.env` 配置项**：`PUSH_PORT`（监听端口，默认 5700）、`PUSH_TOKEN`（鉴权 Token，可选）
 
 **Sub Recorder 配置方式：** 通知设置 → 添加「微信 Bot」渠道，推送地址填 `http://127.0.0.1:5700/notify`（Docker 内改用 `host.docker.internal`）。
+
+---
+
+### v1.2.0 (2026-04-21)
+
+#### Web 管理界面
+
+用 Flask + flask-sock 替换原有的 `http.server` 实现，新增 Web 管理界面。原有 `/notify`、`/health` 接口保持兼容，Sub Recorder 配置无需改动。
+
+前端是三个静态文件（`webui/index.html` + `style.css` + `app.js`），无构建步骤，深色主题，侧边栏导航。日志通过 WebSocket 实时推送，断线后自动重连。
+
+新增管理 API：`/api/status`、`/api/reconnect`、`/api/send`、`/api/schedules`（支持 DELETE）、`/api/notes`（支持查看和 DELETE）。
 
 ---
 

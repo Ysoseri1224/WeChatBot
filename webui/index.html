@@ -8,71 +8,64 @@
 </head>
 <body>
 
-<!-- Sidebar -->
 <nav id="sidebar">
-  <div class="sidebar-logo">
-    <h1>WeChatBot</h1>
-    <span>管理控制台</span>
+  <div class="sidebar-brand">
+    <div class="brand-avatar" id="account-avatar">W</div>
+    <div class="brand-info">
+      <div class="brand-name" id="account-name">WeChatBot</div>
+      <div class="brand-wxid" id="account-wxid">未连接</div>
+    </div>
   </div>
-
-  <div class="nav-item active" data-page="dashboard">
-    <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-    总览
+  <div class="nav-group">
+    <div class="nav-item active" data-page="dashboard">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>总览
+    </div>
+    <div class="nav-item" data-page="logs">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 6h16M4 10h16M4 14h10M4 18h6"/></svg>实时日志
+    </div>
+    <div class="nav-item" data-page="network">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>网络配置
+    </div>
+    <div class="nav-item" data-page="files">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>文件管理
+    </div>
+    <div class="nav-item" data-page="data">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>数据管理
+    </div>
+    <div class="nav-item" data-page="model">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>模型接口
+    </div>
+    <div class="nav-item" data-page="send">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>发送消息
+    </div>
+    <div class="nav-item" data-page="appearance">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>外观配置
+    </div>
   </div>
-  <div class="nav-item" data-page="logs">
-    <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 6h16M4 10h16M4 14h10"/></svg>
-    实时日志
-  </div>
-  <div class="nav-item" data-page="schedules">
-    <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
-    日程
-  </div>
-  <div class="nav-item" data-page="notes">
-    <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
-    笔记
-  </div>
-  <div class="nav-item" data-page="send">
-    <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
-    发送消息
-  </div>
-
   <div class="sidebar-footer" id="ws-status">● 连接中...</div>
 </nav>
 
-<!-- Main -->
 <div id="main">
 
   <!-- ── Dashboard ── -->
   <div class="page active" id="page-dashboard">
-    <div class="status-grid" id="status-grid">
-      <div class="stat-card">
-        <div class="stat-label">微信连接</div>
-        <div class="stat-value" id="stat-wechat">—</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">AI 供应商</div>
-        <div class="stat-value mono" id="stat-ai">—</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">运行时长</div>
-        <div class="stat-value mono" id="stat-uptime">—</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">推送队列</div>
-        <div class="stat-value mono" id="stat-queue">—</div>
-      </div>
+    <div class="page-header"><h2>总览</h2></div>
+    <div class="stat-grid">
+      <div class="stat-card"><div class="stat-label">微信连接</div><div class="stat-value" id="stat-wechat">—</div></div>
+      <div class="stat-card"><div class="stat-label">AI 供应商</div><div class="stat-value mono sm" id="stat-ai">—</div></div>
+      <div class="stat-card"><div class="stat-label">运行时长</div><div class="stat-value mono" id="stat-uptime">—</div></div>
+      <div class="stat-card"><div class="stat-label">推送队列</div><div class="stat-value mono" id="stat-queue">—</div></div>
+      <div class="stat-card"><div class="stat-label">CPU 占用</div><div class="stat-value mono" id="stat-cpu">—</div></div>
+      <div class="stat-card"><div class="stat-label">内存占用</div><div class="stat-value mono" id="stat-mem">—</div></div>
     </div>
-
-    <div class="card">
+    <div class="card" style="margin-top:20px">
       <div class="card-title">操作</div>
       <div style="display:flex;gap:10px;flex-wrap:wrap">
         <button class="btn btn-ghost" onclick="refreshStatus()">
-          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
-          刷新状态
+          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>刷新状态
         </button>
         <button class="btn btn-danger" onclick="reconnect()">
-          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
-          重连微信
+          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>重连微信
         </button>
       </div>
     </div>
@@ -80,9 +73,9 @@
 
   <!-- ── Logs ── -->
   <div class="page" id="page-logs">
+    <div class="page-header"><h2>实时日志</h2></div>
     <div class="card">
-      <div class="card-title">实时日志</div>
-      <div class="log-controls" style="margin-bottom:12px">
+      <div class="log-controls">
         <label><input type="checkbox" id="filter-debug" checked> DEBUG</label>
         <label><input type="checkbox" id="filter-info" checked> INFO</label>
         <label><input type="checkbox" id="filter-warning" checked> WARNING</label>
@@ -94,73 +87,201 @@
     </div>
   </div>
 
-  <!-- ── Schedules ── -->
-  <div class="page" id="page-schedules">
-    <div class="card">
-      <div class="card-title">日程列表</div>
-      <div id="schedules-wrap">
-        <table>
-          <thead>
-            <tr><th>名称</th><th>时间</th><th>星期</th><th>内容</th><th>提醒</th><th></th></tr>
-          </thead>
-          <tbody id="schedules-tbody"></tbody>
-        </table>
-      </div>
-      <div style="margin-top:12px">
-        <button class="btn btn-ghost btn-sm" onclick="loadSchedules()">刷新</button>
+  <!-- ── Network ── -->
+  <div class="page" id="page-network">
+    <div class="page-header"><h2>网络配置</h2></div>
+    <div class="card" style="max-width:520px">
+      <div class="card-title">Sub Recorder 推送</div>
+      <div class="form-section">
+        <div class="form-field">
+          <label>监听端口</label>
+          <input type="text" id="net-port" disabled>
+          <div class="field-hint">修改端口需重启，在 .env 中设置 PUSH_PORT</div>
+        </div>
+        <div class="form-field">
+          <label>鉴权 Token</label>
+          <div style="display:flex;gap:8px">
+            <input type="password" id="net-token" placeholder="留空则不鉴权" style="flex:1">
+            <button class="btn btn-ghost btn-sm" onclick="toggleTokenVisible(this)">显示</button>
+          </div>
+          <div class="field-hint">推送地址：http://127.0.0.1:<span id="net-port-hint">5700</span>/notify</div>
+        </div>
+        <div class="form-field">
+          <label>测试推送接收方</label>
+          <input type="text" id="net-test-to" placeholder="wxid_xxx 或 群ID@chatroom">
+        </div>
+        <div style="display:flex;gap:10px;margin-top:8px">
+          <button class="btn btn-primary" onclick="saveNetworkConfig()">保存 Token</button>
+          <button class="btn btn-ghost" onclick="testPush()">发送测试消息</button>
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- ── Notes ── -->
-  <div class="page" id="page-notes">
-    <div class="card">
-      <div class="card-title">笔记列表</div>
-      <table>
-        <thead><tr><th>名称</th><th>修改时间</th><th></th></tr></thead>
-        <tbody id="notes-tbody"></tbody>
-      </table>
-      <div style="margin-top:12px">
-        <button class="btn btn-ghost btn-sm" onclick="loadNotes()">刷新</button>
+  <!-- ── Files ── -->
+  <div class="page" id="page-files">
+    <div class="page-header"><h2>文件管理</h2></div>
+    <div class="tab-bar">
+      <div class="tab-btn active" onclick="switchFileTab('raw',this)">微信缓存原始文件</div>
+      <div class="tab-btn" onclick="switchFileTab('converted',this)">已转换文件</div>
+    </div>
+    <div class="card" id="ftab-raw">
+      <div class="tab-toolbar">
+        <span class="tab-hint">来自微信缓存目录（WECHAT_FILE_DIR）</span>
+        <button class="btn btn-ghost btn-sm" onclick="loadRawFiles()">刷新</button>
+      </div>
+      <table><thead><tr><th>文件名</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead>
+      <tbody id="raw-files-tbody"></tbody></table>
+    </div>
+    <div class="card" id="ftab-converted" style="display:none">
+      <div class="tab-toolbar">
+        <span class="tab-hint">已保存到 memory/files/</span>
+        <button class="btn btn-ghost btn-sm" onclick="loadConvertedFiles()">刷新</button>
+      </div>
+      <table><thead><tr><th>文件名</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead>
+      <tbody id="converted-files-tbody"></tbody></table>
+    </div>
+  </div>
+
+  <!-- ── Data ── -->
+  <div class="page" id="page-data">
+    <div class="page-header"><h2>数据管理</h2></div>
+    <div class="tab-bar">
+      <div class="tab-btn active" onclick="switchDataTab('schedules',this)">日程</div>
+      <div class="tab-btn" onclick="switchDataTab('notes',this)">笔记</div>
+    </div>
+
+    <div id="dtab-schedules">
+      <div class="card">
+        <div class="tab-toolbar"><span></span><button class="btn btn-ghost btn-sm" onclick="loadSchedules()">刷新</button></div>
+        <table><thead><tr><th>名称</th><th>时间</th><th>星期</th><th>内容</th><th>提醒</th><th>操作</th></tr></thead>
+        <tbody id="schedules-tbody"></tbody></table>
+      </div>
+      <div class="card edit-panel" id="sch-edit-panel" style="display:none">
+        <div class="card-title">编辑日程</div>
+        <div class="form-field"><label>名称</label><input type="text" id="sch-edit-name" style="width:100%"></div>
+        <div class="form-field"><label>备注内容</label><textarea id="sch-edit-content" rows="3" style="width:100%"></textarea></div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="btn btn-primary btn-sm" onclick="saveScheduleEdit()">保存</button>
+          <button class="btn btn-ghost btn-sm" onclick="document.getElementById('sch-edit-panel').style.display='none'">取消</button>
+        </div>
       </div>
     </div>
 
-    <div class="card" id="note-viewer" style="display:none">
-      <div class="card-title" id="note-viewer-title">笔记内容</div>
-      <div id="note-content-box"></div>
-      <div style="margin-top:10px">
-        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('note-viewer').style.display='none'">关闭</button>
+    <div id="dtab-notes" style="display:none">
+      <div class="card">
+        <div class="tab-toolbar"><span></span><button class="btn btn-ghost btn-sm" onclick="loadNotes()">刷新</button></div>
+        <table><thead><tr><th>名称</th><th>修改时间</th><th>操作</th></tr></thead>
+        <tbody id="notes-tbody"></tbody></table>
+      </div>
+      <div class="card edit-panel" id="note-edit-panel" style="display:none">
+        <div class="card-title" id="note-edit-title">笔记</div>
+        <textarea id="note-edit-content" rows="14" style="width:100%;font-family:var(--font-mono);font-size:12px;line-height:1.7"></textarea>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="btn btn-primary btn-sm" onclick="saveNoteEdit()">保存</button>
+          <button class="btn btn-ghost btn-sm" onclick="document.getElementById('note-edit-panel').style.display='none'">取消</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Model ── -->
+  <div class="page" id="page-model">
+    <div class="page-header"><h2>模型接口</h2></div>
+
+    <div class="card">
+      <div class="card-title">AI 供应商</div>
+      <div class="provider-grid" id="provider-grid"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">API Key 管理</div>
+      <table>
+        <thead><tr><th>供应商</th><th>模型</th><th>Key 状态</th><th>操作</th></tr></thead>
+        <tbody id="keys-tbody"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Memory 管理</div>
+      <div class="tab-toolbar" style="margin-bottom:12px">
+        <span class="tab-hint">memory/\*.txt，禁用的条目不注入 AI 上下文</span>
+        <button class="btn btn-ghost btn-sm" onclick="loadMemory()">刷新</button>
+      </div>
+      <table><thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>启用</th><th>操作</th></tr></thead>
+      <tbody id="memory-tbody"></tbody></table>
+    </div>
+    <div class="card edit-panel" id="mem-edit-panel" style="display:none">
+      <div class="card-title" id="mem-edit-title">编辑 Memory</div>
+      <textarea id="mem-edit-content" rows="12" style="width:100%;font-family:var(--font-mono);font-size:12px;line-height:1.7"></textarea>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn btn-primary btn-sm" onclick="saveMemoryEdit()">保存</button>
+        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('mem-edit-panel').style.display='none'">取消</button>
       </div>
     </div>
   </div>
 
   <!-- ── Send ── -->
   <div class="page" id="page-send">
-    <div class="card">
-      <div class="card-title">发送消息</div>
-      <div style="display:flex;flex-direction:column;gap:12px;max-width:520px">
-        <div>
-          <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">接收方 wxid 或群 ID</div>
-          <input type="text" id="send-to" placeholder="wxid_xxx 或 54105533396@chatroom" style="width:100%">
+    <div class="page-header"><h2>发送消息</h2></div>
+    <div class="card" style="max-width:520px">
+      <div class="form-section">
+        <div class="form-field">
+          <label>接收方 wxid 或群 ID</label>
+          <input type="text" id="send-to" placeholder="wxid_xxx 或 54105333396@chatroom" style="width:100%">
         </div>
-        <div>
-          <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">消息内容</div>
-          <textarea id="send-msg" placeholder="输入消息内容..." rows="4"></textarea>
+        <div class="form-field">
+          <label>消息内容</label>
+          <textarea id="send-msg" placeholder="输入消息内容..." rows="5" style="width:100%"></textarea>
         </div>
-        <div>
-          <button class="btn btn-primary" onclick="sendMsg()">
-            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
-            发送
-          </button>
+        <button class="btn btn-primary" onclick="sendMsg()">
+          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>发送
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Appearance ── -->
+  <div class="page" id="page-appearance">
+    <div class="page-header"><h2>外观配置</h2></div>
+    <div class="card" style="max-width:640px">
+      <div class="card-title">选择主题</div>
+      <div class="theme-grid">
+        <div class="theme-card" data-theme="dark" onclick="applyTheme('dark',this)">
+          <div class="theme-preview dark-preview"></div>
+          <div class="theme-label">深色（默认）</div>
         </div>
+        <div class="theme-card" data-theme="heroui" onclick="applyTheme('heroui',this)">
+          <div class="theme-preview heroui-preview"></div>
+          <div class="theme-label">HeroUI</div>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="max-width:640px">
+      <div class="card-title">自定义配色 <span style="font-size:11px;color:var(--text-muted);font-weight:400">（实时预览，保存到 localStorage）</span></div>
+      <div class="color-grid" id="color-grid"></div>
+      <div style="display:flex;gap:10px;margin-top:14px">
+        <button class="btn btn-primary btn-sm" onclick="saveCustomColors()">保存配色</button>
+        <button class="btn btn-ghost btn-sm" onclick="resetCustomColors()">重置</button>
       </div>
     </div>
   </div>
 
 </div><!-- /main -->
 
-<div id="toast"></div>
+<!-- Modal overlay for key editing -->
+<div id="key-modal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeKeyModal()">
+  <div class="modal-box">
+    <div class="modal-title" id="key-modal-title">修改 API Key</div>
+    <input type="text" id="key-modal-input" placeholder="输入新的 API Key" style="width:100%;margin-top:12px">
+    <div style="display:flex;gap:10px;margin-top:14px;justify-content:flex-end">
+      <button class="btn btn-ghost btn-sm" onclick="closeKeyModal()">取消</button>
+      <button class="btn btn-primary btn-sm" onclick="submitKeyModal()">确认</button>
+    </div>
+  </div>
+</div>
 
+<div id="toast"></div>
 <script src="app.js"></script>
 </body>
 </html>

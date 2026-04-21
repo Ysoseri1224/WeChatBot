@@ -20,7 +20,7 @@ python -m venv venv
 .\venv\Scripts\activate
 
 # 3. 安装依赖
-pip install wcferry python-dotenv openai python-docx pymupdf openpyxl python-pptx flask flask-sock
+pip install wcferry python-dotenv openai python-docx pymupdf openpyxl python-pptx flask flask-sock psutil
 
 # 4. 配置环境变量
 copy .env.example .env
@@ -75,10 +75,13 @@ copy .env.example .env
 
 bot 启动后访问 `http://127.0.0.1:5700` 即可打开管理控制台：
 
-- **总览**：微信连接状态、AI 供应商、运行时长、推送队列长度，支持手动重连
-- **实时日志**：WebSocket 推流，按级别过滤（DEBUG/INFO/WARNING/ERROR），自动滚动
-- **日程**：列出所有日程，支持删除
-- **笔记**：列出所有笔记，支持查看和删除
+- **总览**：微信账号头像/wxid、连接状态、AI 供应商、运行时长、CPU/内存占用，支持手动重连
+- **实时日志**：WebSocket 推流，按级别过滤，自动滚动
+- **网络配置**：Sub Recorder Token 管理，测试推送
+- **文件管理**：微信缓存原始文件 + 已转换文件，支持「转化为 md」
+- **数据管理**：日程与笔记统一管理，支持查看、编辑、删除
+- **模型接口**：AI 供应商切换、API Key 管理、Memory 启用/禁用/编辑
+- **外观配置**：深色/HeroUI 主题切换，自定义 CSS 变量配色
 - **发送消息**：手动向任意 wxid 或群 ID 发送消息
 
 ### 日程提醒
@@ -144,6 +147,14 @@ bot 启动后访问 `http://127.0.0.1:5700` 即可打开管理控制台：
 - **`.env` 配置项**：`PUSH_PORT`（监听端口，默认 5700）、`PUSH_TOKEN`（鉴权 Token，可选）
 
 **Sub Recorder 配置方式：** 通知设置 → 添加「微信 Bot」渠道，推送地址填 `http://127.0.0.1:5700/notify`（Docker 内改用 `host.docker.internal`）。
+
+---
+
+### v2.0.0 (2026-04-21)
+
+#### Web 管理界面全面升级
+
+WebUI 从仅有基础状态展示扩展为完整的管理控制台。新增网络配置（Sub Recorder Token 管理）、文件管理（两个目录标签页，支持「转化为 md」）、数据管理（日程+笔记合并，均支持编辑）、模型接口（供应商切换、API Key 修改、Memory 启用/禁用/编辑）和外观配置（深色/HeroUI 主题、自定义 CSS 变量）。Dashboard 新增 CPU/内存占用和微信账号头像/wxid 展示。后端新增 psutil 系统资源监控，memory 禁用通过 `disabled.json` 持久化，无需修改文件名。
 
 ---
 

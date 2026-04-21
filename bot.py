@@ -76,12 +76,49 @@ _schedule_reminder_started = False
 WEEKDAYS_ZH = "一二三四五六日"
 
 
+_MEMORY_DISABLED_FILE = None  # 延迟初始化，依赖 MEMORY_DIR
+
+
+def _memory_disabled_path() -> Path:
+    return MEMORY_DIR / "disabled.json"
+
+
+def memory_disabled_load() -> set:
+    p = _memory_disabled_path()
+    if p.exists():
+        try:
+            return set(json.loads(p.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return set()
+
+
+def memory_disabled_save(disabled: set):
+    _memory_disabled_path().write_text(json.dumps(sorted(disabled), ensure_ascii=False), encoding="utf-8")
+
+
+def memory_disabled_toggle(filename: str) -> bool:
+    """切换禁用状态，返回切换后是否为禁用"""
+    disabled = memory_disabled_load()
+    if filename in disabled:
+        disabled.discard(filename)
+        memory_disabled_save(disabled)
+        return False
+    else:
+        disabled.add(filename)
+        memory_disabled_save(disabled)
+        return True
+
+
 def memory_load_all() -> str:
+    disabled = memory_disabled_load()
     files = sorted(MEMORY_DIR.glob("*.txt"))
     if not files:
         return ""
     parts = []
     for f in files:
+        if f.name in disabled:
+            continue
         parts.append(f"=== 记忆：{f.stem} ===\n{f.read_text(encoding='utf-8', errors='ignore').strip()}")
     return "\n\n".join(parts)
 
@@ -728,6 +765,51 @@ def _recover_files_from_db(wcf, group_ids):
 
     except Exception as e:
         LOG.error(f"[文件恢复] 整体失败: {e}", exc_info=True)
+
+
+def _convert_and_save(src: Path) -> Path:
+    """把 src 文件转换为 Markdown 并保存到 FILE_SAVE_DIR，返回保存路径。"""
+    stem = src.stem
+    _file_convert_status[stem] = {"status": "converting", "path": str(src), "md_path": "", "name": src.name}
+    tmp_path = FILE_SAVE_DIR / src.name
+    shutil.copy2(str(src), tmp_path)
+    md_text, _ = convert_to_markdown(str(tmp_path))
+    if tmp_path.suffix.lower() not in (".md", ".txt"):
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
+    if not md_text:
+        _file_convert_status[stem]["status"] = "error"
+        raise ValueError(f"文件解析为空: {src.name}")
+    save_path = FILE_SAVE_DIR / f"{stem}.md"
+    save_path.write_text(md_text, encoding="utf-8")
+    _file_convert_status[stem]["status"] = "done"
+    _file_convert_status[stem]["md_path"] = str(save_path)
+    LOG.info(f"[转换] 完成: {save_path}，{len(md_text)} 字符")
+    return save_path
+
+
+def _try_write_env(key: str, value: str):
+    """尝试把 key=value 写回 .env 文件（存在则更新，不存在则追加）。"""
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        found = False
+        new_lines = []
+        for line in lines:
+            if re.match(rf"^{re.escape(key)}\s*=", line):
+                new_lines.append(f"{key}={value}\n")
+                found = True
+            else:
+                new_lines.append(line)
+        if not found:
+            new_lines.append(f"{key}={value}\n")
+        env_path.write_text("".join(new_lines), encoding="utf-8")
+    except Exception as e:
+        LOG.warning(f"[WebUI] 写 .env 失败: {e}")
 
 
 def _file_watcher():
@@ -1904,6 +1986,218 @@ def _push_server():
                 _ws_log_clients.remove(ws)
             except ValueError:
                 pass
+
+    # ── 账号信息 ────────────────────────────────────────────────────────
+    @app.route("/api/account")
+    def api_account():
+        wcf = _global_wcf
+        if not wcf:
+            return jsonify({"wxid": "", "name": "", "avatar": ""})
+        try:
+            info = wcf.get_user_info()
+            wxid = info.get("wxid", "") if isinstance(info, dict) else ""
+            name = info.get("name", "") if isinstance(info, dict) else ""
+            avatar_url = info.get("small_head_img_url", "") if isinstance(info, dict) else ""
+        except Exception:
+            wxid, name, avatar_url = "", "", ""
+        return jsonify({"wxid": wxid, "name": name, "avatar": avatar_url})
+
+    # ── 系统资源 ─────────────────────────────────────────────────────────
+    @app.route("/api/sysinfo")
+    def api_sysinfo():
+        try:
+            import psutil as _ps
+            cpu = _ps.cpu_percent(interval=0.2)
+            mem = _ps.virtual_memory()
+            return jsonify({"cpu": round(cpu, 1), "mem_used": mem.used, "mem_total": mem.total, "mem_pct": round(mem.percent, 1)})
+        except Exception:
+            return jsonify({"cpu": None, "mem_used": None, "mem_total": None, "mem_pct": None})
+
+    # ── 文件管理 ─────────────────────────────────────────────────────────
+    @app.route("/api/files/raw")
+    def api_files_raw():
+        exts = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf", ".txt", ".md"}
+        try:
+            files = [p for p in Path(WECHAT_FILE_DIR).iterdir() if p.suffix.lower() in exts]
+            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return jsonify([{"name": p.name, "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)} for p in files])
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/files/converted")
+    def api_files_converted():
+        try:
+            files = sorted(FILE_SAVE_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+            return jsonify([{"name": p.name, "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)} for p in files if p.is_file()])
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/files/convert", methods=["POST"])
+    def api_files_convert():
+        body = request.get_json(silent=True) or {}
+        filename = str(body.get("filename", "")).strip()
+        if not filename:
+            return jsonify({"ok": False, "msg": "missing filename"}), 400
+        src = Path(WECHAT_FILE_DIR) / filename
+        if not src.exists():
+            return jsonify({"ok": False, "msg": "file not found"}), 404
+        def _do_convert():
+            try:
+                _convert_and_save(src)
+            except Exception as e:
+                LOG.error(f"[WebUI] 转换失败: {e}")
+        Thread(target=_do_convert, daemon=True).start()
+        return jsonify({"ok": True, "msg": f"已开始转换 {filename}"})
+
+    @app.route("/api/files/converted/<path:name>", methods=["DELETE"])
+    def api_delete_converted(name):
+        p = FILE_SAVE_DIR / name
+        if not p.exists():
+            return jsonify({"error": "not found"}), 404
+        p.unlink()
+        return jsonify({"ok": True})
+
+    # ── 日程编辑 ────────────────────────────────────────────────────────
+    @app.route("/api/schedules/<int:sid>", methods=["PUT"])
+    def api_update_schedule(sid):
+        body = request.get_json(silent=True) or {}
+        name    = body.get("name")
+        content = body.get("content")
+        try:
+            conn = sqlite3.connect(str(SCHEDULES_DB))
+            if name is not None:
+                conn.execute("UPDATE schedules SET name=? WHERE id=?", (name, sid))
+            if content is not None:
+                conn.execute("UPDATE schedules SET content=? WHERE id=?", (content, sid))
+            conn.commit()
+            conn.close()
+            return jsonify({"ok": True})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    # ── 笔记编辑 ────────────────────────────────────────────────────────
+    @app.route("/api/notes/<name>", methods=["PUT"])
+    def api_update_note(name):
+        body = request.get_json(silent=True) or {}
+        content = body.get("content", "")
+        matches = [p for p in NOTES_DIR.glob("*.txt") if p.stem.lower() == name.lower()]
+        if not matches:
+            return jsonify({"error": "not found"}), 404
+        matches[0].write_text(content, encoding="utf-8")
+        return jsonify({"ok": True})
+
+    # ── 模型接口 ─────────────────────────────────────────────────────────
+    @app.route("/api/model/provider", methods=["GET", "POST"])
+    def api_model_provider():
+        global AI_PROVIDER, AI_MODEL, client, _api_key, _base_url
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            p = str(body.get("provider", "")).lower().strip()
+            if p not in _PROVIDER_CONFIGS:
+                return jsonify({"ok": False, "msg": f"未知供应商: {p}"}), 400
+            AI_PROVIDER = p
+            _api_key, _base_url, AI_MODEL = _PROVIDER_CONFIGS[p]
+            client = OpenAI(api_key=_api_key, base_url=_base_url)
+            LOG.info(f"[WebUI] AI 供应商切换为: {AI_PROVIDER} ({AI_MODEL})")
+            return jsonify({"ok": True, "provider": AI_PROVIDER, "model": AI_MODEL})
+        return jsonify({"provider": AI_PROVIDER, "model": AI_MODEL, "available": list(_PROVIDER_CONFIGS.keys())})
+
+    @app.route("/api/model/keys", methods=["GET", "POST"])
+    def api_model_keys():
+        global _PROVIDER_CONFIGS, _api_key, _base_url, AI_MODEL, client
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            provider = str(body.get("provider", "")).lower().strip()
+            new_key  = str(body.get("key", "")).strip()
+            if provider not in _PROVIDER_CONFIGS:
+                return jsonify({"ok": False, "msg": "未知供应商"}), 400
+            old_url, old_model = _PROVIDER_CONFIGS[provider][1], _PROVIDER_CONFIGS[provider][2]
+            _PROVIDER_CONFIGS[provider] = (new_key, old_url, old_model)
+            if provider == AI_PROVIDER:
+                _api_key = new_key
+                client = OpenAI(api_key=_api_key, base_url=_base_url)
+            _try_write_env(f"{provider.upper()}_API_KEY", new_key)
+            return jsonify({"ok": True})
+        keys_info = {}
+        for p, (k, url, model) in _PROVIDER_CONFIGS.items():
+            masked = ("*" * (len(k) - 4) + k[-4:]) if k and len(k) > 4 else ("***" if k else "")
+            keys_info[p] = {"masked": masked, "set": bool(k), "model": model, "base_url": url}
+        return jsonify(keys_info)
+
+    # ── Memory 管理 ──────────────────────────────────────────────────────
+    @app.route("/api/memory")
+    def api_memory_list():
+        disabled = memory_disabled_load()
+        files = sorted(MEMORY_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        result = []
+        for f in files:
+            result.append({
+                "name": f.stem,
+                "filename": f.name,
+                "size": f.stat().st_size,
+                "mtime": int(f.stat().st_mtime),
+                "enabled": f.name not in disabled,
+            })
+        return jsonify(result)
+
+    @app.route("/api/memory/<name>")
+    def api_memory_read(name):
+        safe = re.sub(r'[\\/:*?"<>|]', '_', name)
+        if not safe.endswith(".txt"):
+            safe += ".txt"
+        p = MEMORY_DIR / safe
+        if not p.exists():
+            return jsonify({"error": "not found"}), 404
+        return jsonify({"name": p.stem, "filename": p.name, "content": p.read_text(encoding="utf-8", errors="ignore")})
+
+    @app.route("/api/memory/<name>", methods=["PUT"])
+    def api_memory_update(name):
+        body = request.get_json(silent=True) or {}
+        content = body.get("content", "")
+        safe = re.sub(r'[\\/:*?"<>|]', '_', name)
+        if not safe.endswith(".txt"):
+            safe += ".txt"
+        p = MEMORY_DIR / safe
+        if not p.exists():
+            return jsonify({"error": "not found"}), 404
+        p.write_text(content, encoding="utf-8")
+        return jsonify({"ok": True})
+
+    @app.route("/api/memory/<name>", methods=["DELETE"])
+    def api_memory_delete(name):
+        ok = memory_delete(name)
+        return jsonify({"ok": ok}) if ok else (jsonify({"error": "not found"}), 404)
+
+    @app.route("/api/memory/<name>/toggle", methods=["POST"])
+    def api_memory_toggle(name):
+        safe = re.sub(r'[\\/:*?"<>|]', '_', name)
+        if not safe.endswith(".txt"):
+            safe += ".txt"
+        is_disabled = memory_disabled_toggle(safe)
+        return jsonify({"ok": True, "enabled": not is_disabled})
+
+    # ── 网络配置（Sub Recorder） ─────────────────────────────────────────
+    @app.route("/api/network/config")
+    def api_network_config():
+        return jsonify({"port": PUSH_PORT, "token_set": bool(PUSH_TOKEN)})
+
+    @app.route("/api/network/token", methods=["POST"])
+    def api_network_token():
+        global PUSH_TOKEN
+        body = request.get_json(silent=True) or {}
+        new_token = str(body.get("token", "")).strip()
+        PUSH_TOKEN = new_token
+        _try_write_env("PUSH_TOKEN", new_token)
+        return jsonify({"ok": True})
+
+    @app.route("/api/push_test", methods=["POST"])
+    def api_push_test():
+        body = request.get_json(silent=True) or {}
+        to = str(body.get("to", "")).strip()
+        if not to:
+            return jsonify({"ok": False, "msg": "missing to"}), 400
+        q.put((to, "[WeChatBot] 推送测试消息 ✓"))
+        return jsonify({"ok": True})
 
     LOG.info(f"[WebUI] 管理界面已启动: http://127.0.0.1:{PUSH_PORT}")
     app.run(host="0.0.0.0", port=PUSH_PORT, debug=False, use_reloader=False)
